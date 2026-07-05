@@ -45,6 +45,47 @@ class SQLiteSignalStore:
                 "ON signal_snapshots(symbol, as_of_time)"
             )
             self._init_feedback_table(conn)
+            self._init_positions_table(conn)
+
+    @staticmethod
+    def _init_positions_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                stock_name TEXT,
+                entry_date TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                position_size REAL,
+                entry_reason TEXT,
+                entry_signal_id TEXT,
+                entry_action TEXT,
+                stop_loss_price REAL,
+                take_profit_price REAL,
+                max_holding_days INTEGER,
+                status TEXT NOT NULL,
+                exit_date TEXT,
+                exit_price REAL,
+                exit_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                metadata_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_positions_status_symbol "
+            "ON positions(status, symbol)"
+        )
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_positions_one_open_symbol "
+                "ON positions(symbol) WHERE status = 'open'"
+            )
+        except sqlite3.IntegrityError:
+            # 旧开发库若已有重复 open 记录，不阻断其他模块启动；manager 仍会拒绝新增重复。
+            pass
 
     @staticmethod
     def _init_feedback_table(conn: sqlite3.Connection) -> None:

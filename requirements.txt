@@ -8,3 +8,6 @@ python-dotenv>=1.0.0
 # Optional real data providers:
 # baostock>=0.8.9
 # akshare>=1.18.0
+
+# Optional local web app:
+# streamlit>=1.35.0

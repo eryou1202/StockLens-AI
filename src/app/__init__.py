@@ -1,0 +1,1 @@
+"""StockLens local application UI."""
