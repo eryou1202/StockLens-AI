@@ -1,0 +1,9 @@
+[project]
+name = "ai-quant-stock-assistant-data-scaffold"
+version = "0.1.0"
+description = "AI candidate pool plus quant market data provider scaffold"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

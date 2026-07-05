@@ -1,0 +1,58 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables / secrets
+.env
+.env.*
+*.key
+*.pem
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Data / local databases
+*.db
+*.sqlite
+*.sqlite3
+data/
+datasets/
+outputs/
+reports/
+artifacts/
+
+# Model files
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# Notebook checkpoints
+.ipynb_checkpoints/

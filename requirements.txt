@@ -1,0 +1,10 @@
+pandas>=2.2.0
+numpy>=1.26.0
+pydantic>=2.6.0
+PyYAML>=6.0.1
+rich>=13.7.0
+python-dotenv>=1.0.0
+
+# Optional real data providers:
+# baostock>=0.8.9
+# akshare>=1.18.0
