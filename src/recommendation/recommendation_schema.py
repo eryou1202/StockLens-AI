@@ -29,6 +29,7 @@ class ActionLevel(str, Enum):
 class Recommendation(BaseModel):
     symbol: str
     stock_name: str | None = None
+    source_type: str = "unknown"
     as_of_time: datetime
     action: RecommendationAction
     action_level: ActionLevel

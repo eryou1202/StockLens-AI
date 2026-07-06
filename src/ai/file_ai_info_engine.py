@@ -124,6 +124,10 @@ class FileAIInfoEngine(AIInfoEngine):
             "quant_focus": [
                 item.model_dump(mode="json") for item in candidate.quant_focus
             ],
+            "candidate_metadata": candidate.metadata,
+            "source_type": candidate.metadata.get("source_type", "ai_signal"),
+            "manual_review_required": candidate.metadata.get("manual_review_required", False),
+            "manual_notes": candidate.metadata.get("notes"),
         }
 
         return AICandidate(

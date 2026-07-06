@@ -40,7 +40,7 @@ dist/
 *.db
 *.sqlite
 *.sqlite3
-data/
+/data/
 datasets/
 outputs/
 reports/

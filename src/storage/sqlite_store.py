@@ -46,6 +46,7 @@ class SQLiteSignalStore:
             )
             self._init_feedback_table(conn)
             self._init_positions_table(conn)
+            self._init_recommendation_tracking_table(conn)
 
     @staticmethod
     def _init_positions_table(conn: sqlite3.Connection) -> None:
@@ -86,6 +87,59 @@ class SQLiteSignalStore:
         except sqlite3.IntegrityError:
             # 旧开发库若已有重复 open 记录，不阻断其他模块启动；manager 仍会拒绝新增重复。
             pass
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_positions_one_watch_symbol "
+                "ON positions(symbol) WHERE status = 'watch_only'"
+            )
+        except sqlite3.IntegrityError:
+            pass
+
+    @staticmethod
+    def _init_recommendation_tracking_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recommendation_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                stock_name TEXT,
+                as_of_time TEXT NOT NULL,
+                source_type TEXT,
+                action TEXT NOT NULL,
+                action_level TEXT,
+                confidence REAL,
+                final_score REAL,
+                ai_view TEXT,
+                quant_decision TEXT,
+                final_level TEXT,
+                current_price REAL,
+                suggested_horizon_days_json TEXT,
+                reason_json TEXT,
+                risks_json TEXT,
+                invalid_conditions_json TEXT,
+                future_return_1d REAL,
+                future_return_3d REAL,
+                future_return_5d REAL,
+                future_return_10d REAL,
+                future_max_drawdown_5d REAL,
+                future_max_drawdown_10d REAL,
+                tracking_status TEXT NOT NULL,
+                manual_verdict TEXT,
+                manual_notes TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                metadata_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_recommendation_tracking_status_as_of "
+            "ON recommendation_tracking(tracking_status, as_of_time)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_recommendation_tracking_symbol "
+            "ON recommendation_tracking(symbol)"
+        )
 
     @staticmethod
     def _init_feedback_table(conn: sqlite3.Connection) -> None:

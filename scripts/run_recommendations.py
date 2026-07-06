@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from datetime import datetime
 
 from rich.console import Console
@@ -16,6 +17,7 @@ from src.recommendation.recommendation_explainer import ACTION_LABELS
 from src.recommendation.recommendation_schema import Recommendation
 from src.reports.report_builder import ReportBuilder
 from src.storage.sqlite_store import SQLiteSignalStore
+from src.tracking.recommendation_tracker import RecommendationTracker
 
 
 def run_recommendation_analysis(
@@ -43,6 +45,9 @@ def run_recommendation_analysis(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Run StockLens recommendations.")
+    parser.add_argument("--save-tracking", action="store_true", help="Save this recommendation snapshot.")
+    args = parser.parse_args()
     try:
         recommendations = run_recommendation_analysis()
     except Exception as exc:
@@ -50,11 +55,16 @@ def main() -> None:
         return
 
     table = Table(title="StockLens 推荐候选（仅供研究，不构成投资建议）")
-    for column in ("股票", "action", "level", "confidence", "AI观点", "量化观点", "final_score", "主要理由"):
+    if args.save_tracking:
+        count = RecommendationTracker(load_settings().database_path).save_recommendations(recommendations)
+        print(f"已保存追踪快照：{count} 条（重复快照自动跳过）。")
+
+    for column in ("股票", "source_type", "action", "level", "confidence", "AI观点", "量化观点", "final_score", "主要理由"):
         table.add_column(column)
     for item in recommendations:
         table.add_row(
-            f"{item.symbol} {item.stock_name or ''}",
+            f"{item.symbol} {item.stock_name or '未知名称'}",
+            item.source_type,
             ACTION_LABELS[item.action],
             item.action_level.value,
             f"{item.confidence:.2f}",
