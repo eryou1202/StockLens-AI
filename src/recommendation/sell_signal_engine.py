@@ -9,9 +9,30 @@ from src.recommendation.sell_rules import calc_unrealized_return, is_trend_broke
 
 
 class SellSignalEngine:
-    def build_sell_signal(self, position: Position, decision: FinalDecision) -> Recommendation:
+    def build_sell_signal(
+        self,
+        position: Position,
+        decision: FinalDecision,
+        current_price: float | None = None,
+        price_time: str | None = None,
+        price_source: str | None = None,
+        require_fresh_price: bool = False,
+    ) -> Recommendation:
         context = RecommendationEngine.extract_quant_context(decision)
-        current_price = ReasonEngine.number(context.get("latest_close"))
+        quant_price = ReasonEngine.number(context.get("latest_close"))
+        fetched_price = ReasonEngine.number(current_price)
+        if fetched_price is not None and fetched_price > 0:
+            # The caller extracted this value from the newest bar returned by this check.
+            # It is authoritative even if an older/invalid quant context is supplied.
+            current_price = fetched_price
+            resolved_price_source = price_source or "latest_market_bar"
+        elif require_fresh_price:
+            current_price = None
+            resolved_price_source = price_source or "unavailable"
+        else:
+            current_price = quant_price
+            resolved_price_source = price_source or "quant_feature_latest_close"
+        context["latest_close"] = current_price
         quant_decision = str(context.get("quant_decision"))
         final_level = str(getattr(decision.final_level, "value", decision.final_level))
         is_watch = position.status == PositionStatus.WATCH_ONLY or position.entry_price <= 0.01
@@ -19,13 +40,15 @@ class SellSignalEngine:
             "position_id": position.id, "position_status": position.status.value,
             "is_watch_only": is_watch, "entry_price": position.entry_price,
             "current_price": current_price, "unrealized_return": None, "triggered_rules": [],
+            "price_time": price_time,
+            "price_source": resolved_price_source,
             **context,
         }
 
         if current_price is None or current_price <= 0:
             return self._result(position, decision, RecommendationAction.RISK_WARNING,
-                ActionLevel.MEDIUM, ["当前缺少可用最新价格，只能暂停收益判断并继续观察。"],
-                ["请先刷新行情数据；缺失价格时不计算浮动收益或止损止盈。"], base_metadata)
+                ActionLevel.MEDIUM, ["无法获取最新价格，本次只能暂停收益判断并继续观察。"],
+                ["本次行情拉取没有返回有效收盘价，因此没有计算浮盈、止损或止盈。"], base_metadata)
 
         if is_watch:
             return self._watch_only_signal(position, decision, base_metadata)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -16,6 +16,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.check_sell_signals import build_open_position_sell_signals
 from scripts.run_recommendations import run_recommendation_analysis
+from src.audit.algorithm_audit import AlgorithmAuditRunner
+from src.audit.audit_metrics import AuditMetricsBuilder
+from src.audit.audit_schema import AuditRequest, AuditSummary
+from src.audit.audit_store import AuditStore
+from src.audit.universe_loader import load_symbols_from_file, normalize_symbols
 from src.config.settings import load_settings
 from src.data.provider_factory import create_market_data_provider
 from src.data.symbol_name_resolver import SymbolNameResolver
@@ -108,6 +113,46 @@ def _tracking_rows(items) -> list[dict]:
     } for item in items]
 
 
+def _audit_group_frame(groups: dict, group_name: str) -> pd.DataFrame:
+    return pd.DataFrame([
+        {group_name: name, **values} for name, values in groups.items()
+    ])
+
+
+def _show_audit_summary(summary: AuditSummary, export_paths: dict | None = None) -> None:
+    st.markdown(f"#### 审查结果 · audit_id={summary.audit_id}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("样本数", summary.samples_count)
+    c2.metric("完整样本", summary.complete_samples)
+    c3.metric("排序警告", "是" if summary.ranking_warning else "否")
+    st.write("动作分布：", summary.action_distribution)
+    st.markdown("##### 按推荐动作分组")
+    st.dataframe(
+        _audit_group_frame(summary.action_metrics, "action"),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.markdown("##### 按量化判断分组")
+    st.dataframe(
+        _audit_group_frame(summary.quant_decision_metrics, "quant_decision"),
+        use_container_width=True,
+        hide_index=True,
+    )
+    correlations = pd.DataFrame([
+        {"评分": "综合量化评分", "未来 5 日相关性": summary.score_future_return_corr_5d,
+         "未来 10 日相关性": summary.score_future_return_corr_10d},
+        {"评分": "最终融合评分", "未来 5 日相关性": summary.final_score_future_return_corr_5d,
+         "未来 10 日相关性": summary.final_score_future_return_corr_10d},
+    ])
+    st.markdown("##### 评分与未来收益相关性")
+    st.dataframe(correlations, use_container_width=True, hide_index=True)
+    if summary.ranking_warning:
+        st.warning("当前样本中积极动作/量化支持的 5 日胜率排序出现反常，请检查规则，不要据此做真实交易判断。")
+    if export_paths:
+        st.markdown("##### CSV 导出路径")
+        st.code("\n".join(f"{name}: {path}" for name, path in export_paths.items()))
+
+
 st.title("📈 StockLens AI 本地控制台 · MVP v1.1.1")
 st.warning("仅用于研究和辅助决策，不构成投资建议。所有买入、卖出、持有输出均为候选或提醒。")
 
@@ -124,8 +169,8 @@ with st.sidebar:
         st.session_state["data_output"] = _run_module("scripts.dataset_status")
     st.caption("本地应用不会联网爬新闻、自动交易或连接券商。")
 
-tab_recommend, tab_positions, tab_sell, tab_tracking, tab_data, tab_diagnostics = st.tabs([
-    "候选股推荐", "持仓 / 观察管理", "卖出提醒", "追踪复盘", "数据与反馈", "诊断工具"
+tab_recommend, tab_positions, tab_sell, tab_tracking, tab_data, tab_diagnostics, tab_audit = st.tabs([
+    "候选股推荐", "持仓 / 观察管理", "卖出提醒", "追踪复盘", "数据与反馈", "诊断工具", "算法审查"
 ])
 
 with tab_recommend:
@@ -294,13 +339,23 @@ with tab_positions:
 
 with tab_sell:
     st.subheader("卖出提醒与观察风险")
+    st.caption("当前价格来自最新可用行情；如果行情源为日线，则不是盘中实时价。")
     if st.button("检查卖出提醒", type="primary"):
+        # Never render a previous check while a new refresh is running or after it fails.
+        st.session_state.pop("sell_signals", None)
+        st.session_state.pop("sell_signals_checked_at", None)
         try:
             with st.spinner("正在检查 open / watch_only..."):
-                signals = build_open_position_sell_signals()
+                signals = build_open_position_sell_signals(
+                    use_cache=False,
+                    force_refresh=True,
+                )
             st.session_state["sell_signals"] = [item.model_dump(mode="json") for item in signals]
+            st.session_state["sell_signals_checked_at"] = datetime.now().isoformat(timespec="seconds")
         except Exception as exc:
             st.error(f"检查失败：{type(exc).__name__}: {exc}")
+    if st.session_state.get("sell_signals_checked_at"):
+        st.caption(f"本次检查时间：{st.session_state['sell_signals_checked_at']}")
     signals = [Recommendation.model_validate(item) for item in st.session_state.get("sell_signals", [])]
     if signals:
         rows = []
@@ -309,9 +364,12 @@ with tab_sell:
             rows.append({
                 "股票代码": item.symbol, "股票名称": item.stock_name or "未知名称",
                 "position_status": meta.get("position_status"), "is_watch_only": meta.get("is_watch_only"),
-                "action": ACTION_LABELS[item.action], "current_price": "-" if meta.get("current_price") is None else f"{meta['current_price']:.2f}",
+                "action": ACTION_LABELS[item.action],
+                "current_price": "未获取" if meta.get("current_price") is None else f"{meta['current_price']:.2f}",
+                "price_time": meta.get("price_time") or "未获取",
+                "price_source": meta.get("price_source") or "未获取",
                 "entry_price": "-" if meta.get("is_watch_only") else f"{meta['entry_price']:.2f}",
-                "unrealized_return_percent": _pct(meta.get("unrealized_return")),
+                "unrealized_return_percent": "-" if meta.get("is_watch_only") else _pct(meta.get("unrealized_return")),
                 "triggered_rules": "；".join(meta.get("triggered_rule_labels", [])),
                 "reason_detail": "；".join(item.reason), "risk_detail": "；".join(item.risks),
             })
@@ -391,3 +449,97 @@ with tab_diagnostics:
             st.session_state["diagnostic_output"] = _run_module(module)
     if st.session_state.get("diagnostic_output"):
         st.code(st.session_state["diagnostic_output"], language="text")
+
+with tab_audit:
+    st.subheader("算法审查实验室（独立实验数据，不影响正式推荐）")
+    st.info(
+        "该功能用于大范围、长时间审查量化推荐框架。结果只写入 data/audit/，"
+        "不会写入正式追踪、持仓、反馈、信号快照或候选池。"
+    )
+    st.warning("大范围审查可能耗时较久，建议先使用 10～30 只股票测试。")
+    with st.form("algorithm_audit_form"):
+        d1, d2 = st.columns(2)
+        audit_start = d1.date_input("start_date", value=(datetime.now() - timedelta(days=90)).date())
+        audit_end = d2.date_input("end_date", value=(datetime.now() - timedelta(days=10)).date())
+        audit_symbols = st.text_area(
+            "symbols（支持逗号、空格或换行分隔）",
+            value="300750.SZ, 000001.SZ, 600030.SH",
+        )
+        audit_symbols_file = st.text_input("symbols_file（可选）", placeholder="data/universe/my_symbols.txt")
+        a1, a2, a3 = st.columns(3)
+        audit_step = a1.number_input("step_days", min_value=1, value=5, step=1)
+        audit_lookback = a2.number_input("lookback_days", min_value=30, value=120, step=10)
+        audit_max_symbols = a3.number_input("max_symbols（0 表示不限）", min_value=0, value=0, step=1)
+        audit_name = st.text_input("audit_name", value="streamlit_audit")
+        audit_export = st.checkbox("export_csv", value=True)
+        run_audit = st.form_submit_button("运行算法审查", type="primary")
+
+    if run_audit:
+        try:
+            raw_symbols = [audit_symbols]
+            if audit_symbols_file.strip():
+                raw_symbols.extend(load_symbols_from_file(audit_symbols_file.strip()))
+            symbols = normalize_symbols(raw_symbols)
+            request = AuditRequest(
+                start_date=datetime.combine(audit_start, time(15, 0)),
+                end_date=datetime.combine(audit_end, time(15, 0)),
+                symbols=symbols,
+                step_days=int(audit_step),
+                lookback_days=int(audit_lookback),
+                max_symbols=int(audit_max_symbols) or None,
+                audit_name=audit_name or None,
+            )
+            audit_store = AuditStore("data/audit/algorithm_audit.sqlite")
+            audit_id = audit_store.create_run(request)
+            progress_bar = st.progress(0.0)
+            progress_text = st.empty()
+
+            def update_audit_progress(symbol, as_of_time, completed, total):
+                progress_bar.progress(completed / max(total, 1))
+                progress_text.caption(
+                    f"{completed}/{total} · {symbol} · {as_of_time.date().isoformat()}"
+                )
+
+            provider = create_market_data_provider(
+                SETTINGS.market_provider,
+                cache_dir="data/audit/cache",
+                use_cache=True,
+            )
+            with st.spinner("正在运行独立算法审查，请勿关闭页面..."):
+                samples = AlgorithmAuditRunner(
+                    SETTINGS, provider, progress_callback=update_audit_progress
+                ).run(request, audit_id=audit_id)
+                audit_store.save_samples(samples)
+                metrics = AuditMetricsBuilder.build_summary(samples)
+                audit_store.finalize_run(audit_id, metrics)
+                paths = audit_store.export_csv(audit_id) if audit_export else {}
+                summary = audit_store.load_summary(audit_id)
+            st.session_state["audit_summary"] = summary.model_dump(mode="json")
+            st.session_state["audit_export_paths"] = paths
+            st.success(f"算法审查完成：audit_id={audit_id}")
+        except Exception as exc:
+            st.error(f"算法审查失败：{type(exc).__name__}: {exc}")
+
+    b1, b2 = st.columns(2)
+    if b1.button("查看最近一次算法审查结果", use_container_width=True):
+        try:
+            recent = AuditStore().load_summary("latest")
+            st.session_state["audit_summary"] = recent.model_dump(mode="json")
+            st.session_state["audit_export_paths"] = {}
+        except Exception as exc:
+            st.error(f"读取最近审查失败：{type(exc).__name__}: {exc}")
+    if b2.button("导出最近一次算法审查 CSV", use_container_width=True):
+        try:
+            paths = AuditStore().export_csv("latest")
+            recent = AuditStore().load_summary("latest")
+            st.session_state["audit_summary"] = recent.model_dump(mode="json")
+            st.session_state["audit_export_paths"] = paths
+            st.success("最近一次审查已导出。")
+        except Exception as exc:
+            st.error(f"导出最近审查失败：{type(exc).__name__}: {exc}")
+
+    if st.session_state.get("audit_summary"):
+        _show_audit_summary(
+            AuditSummary.model_validate(st.session_state["audit_summary"]),
+            st.session_state.get("audit_export_paths") or None,
+        )

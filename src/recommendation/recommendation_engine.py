@@ -104,6 +104,8 @@ class RecommendationEngine:
             if value is None and features is not None:
                 value = getattr(features, name, None)
             if value is None:
+                value = extra.get(name)
+            if value is None:
                 value = fallbacks.get(name)
             try:
                 return None if value is None else float(value)
