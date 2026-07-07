@@ -47,15 +47,17 @@ def main() -> None:
     print(f"scanned_count: {result['scanned_count']}")
     print(f"excluded_count: {result['excluded_count']}")
     print(f"latest_as_of_date: {result['latest_as_of_date']}")
+    print(f"candidate_bucket_counts: {result['candidate_bucket_counts']}")
     print(f"excluded_summary: {result['excluded_summary']}")
     top = pd.DataFrame(result["top_candidates"])
     if top.empty:
         print("Top candidates: none")
     else:
         columns = [
-            "rank", "symbol", "stock_name", "current_price", "coarse_score",
+            "rank", "symbol", "stock_name", "candidate_bucket", "current_price",
+            "raw_coarse_score", "coarse_score",
             "quant_score", "quant_decision", "return_5d", "return_20d",
-            "risk_score", "overheat_score", "amount_ratio_5d",
+            "risk_score", "overheat_score", "amount_ratio_5d", "risk_flags",
         ]
         print(f"Top {len(top)} candidates:")
         print(top[columns].to_string(index=False))

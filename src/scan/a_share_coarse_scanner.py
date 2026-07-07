@@ -28,7 +28,8 @@ class AShareCoarseScanner:
 
     OUTPUT_FIELDS = [
         "rank", "result_group", "symbol", "stock_name", "exchange", "as_of_date",
-        "current_price", "coarse_score", "quant_score", "quant_decision",
+        "current_price", "raw_coarse_score", "display_coarse_score", "coarse_score",
+        "candidate_bucket", "quant_score", "quant_decision",
         "trend_score", "momentum_score", "volume_score", "risk_score",
         "overheat_score", "macd_score", "return_1d", "return_3d", "return_5d",
         "return_10d", "return_20d", "volume_ratio_5d", "amount_ratio_5d",
@@ -109,7 +110,12 @@ class AShareCoarseScanner:
             if (value := self._number(row.get("return_20d"))) is not None
         ])
         for row in eligible:
-            row["coarse_score"] = self._coarse_score(row, median_return_20d)
+            row["raw_coarse_score"] = self._raw_coarse_score(row, median_return_20d)
+            row["candidate_bucket"] = self._candidate_bucket(row)
+        self._set_display_scores(eligible)
+        candidate_bucket_counts = Counter(
+            str(row.get("candidate_bucket")) for row in eligible if row.get("candidate_bucket")
+        )
 
         risky = [row for row in eligible if row.get("risk_flags")]
         eligible.sort(key=self._sort_key, reverse=True)
@@ -118,6 +124,14 @@ class AShareCoarseScanner:
         excluded.sort(key=lambda row: (row.get("symbol") or ""))
 
         top_limit = max(1, int(limit))
+        bucket_candidates = {
+            bucket: [
+                row for row in eligible if row.get("candidate_bucket") == bucket
+            ][:top_limit]
+            for bucket in (
+                "low_risk_watch", "momentum_watch", "high_risk_momentum", "avoid_chasing"
+            )
+        }
         top_symbols = {row["symbol"] for row in eligible[:top_limit]}
         for index, row in enumerate(eligible, start=1):
             row["rank"] = index
@@ -147,6 +161,8 @@ class AShareCoarseScanner:
             "excluded_count": len(excluded),
             "top_candidates": top_candidates,
             "risk_candidates": risk_candidates,
+            "bucket_candidates": bucket_candidates,
+            "candidate_bucket_counts": dict(sorted(candidate_bucket_counts.items())),
             "excluded_summary": dict(sorted(exclusion_counts.items())),
             "metadata": {
                 "scan_type": "a_share_coarse_scan",
@@ -157,6 +173,7 @@ class AShareCoarseScanner:
                 "include_risky": include_risky,
                 "risk_candidates_total": len(risky),
                 "eligible_total": len(eligible),
+                "candidate_bucket_counts": dict(sorted(candidate_bucket_counts.items())),
                 "symbols_file": symbols_file,
             },
             "all_results": eligible + excluded,
@@ -333,7 +350,10 @@ class AShareCoarseScanner:
             "exchange": item.get("exchange"),
             "as_of_date": latest.trade_time.date().isoformat() if latest else None,
             "current_price": features.latest_close,
+            "raw_coarse_score": None,
+            "display_coarse_score": None,
             "coarse_score": None,
+            "candidate_bucket": None,
             "quant_score": scores.quant_score,
             "quant_decision": scores.quant_decision,
             "trend_score": scores.trend_score,
@@ -369,7 +389,8 @@ class AShareCoarseScanner:
         return row
 
     @staticmethod
-    def _coarse_score(row: dict[str, Any], median_return_20d: float | None) -> float:
+    def _raw_coarse_score(row: dict[str, Any], median_return_20d: float | None) -> float:
+        """Uncapped ranking score; only the coarse scan uses these adjustments."""
         score = float(row.get("quant_score") or 0.0)
         decision = row.get("quant_decision")
         if decision == "support":
@@ -383,25 +404,104 @@ class AShareCoarseScanner:
             score += 2.0
         risk = float(row.get("risk_score") or 0.0)
         overheat = float(row.get("overheat_score") or 0.0)
-        score -= max(0.0, risk - 65.0) * 0.20
-        score -= max(0.0, overheat - 65.0) * 0.20
         return_5d = AShareCoarseScanner._number(row.get("return_5d"))
         return_20d = AShareCoarseScanner._number(row.get("return_20d"))
-        if return_5d is not None and return_5d > 0.12:
-            score -= 4.0
+
+        # Anti-chase penalties are deliberately cumulative. Strong stocks remain
+        # visible, but extreme short-term gains no longer dominate the first page.
+        if return_5d is not None and return_5d > 0.10:
+            score -= 8.0
+        if return_5d is not None and return_5d > 0.15:
+            score -= 8.0
+        if return_20d is not None and return_20d > 0.20:
+            score -= 10.0
         if return_20d is not None and return_20d > 0.30:
-            score -= 5.0
+            score -= 10.0
+        if overheat > 50.0:
+            score -= 4.0 + (overheat - 50.0) * 0.25
+        if risk > 55.0:
+            score -= 4.0 + (risk - 55.0) * 0.25
         if return_20d is not None and median_return_20d is not None:
             relative = return_20d - median_return_20d
             if relative >= 0.03:
                 score += 2.0
             elif relative <= -0.03:
                 score -= 2.0
-        return round(clip(score, 0.0, 100.0), 4)
+        return round(score, 6)
+
+    @staticmethod
+    def _set_display_scores(rows: list[dict[str, Any]]) -> None:
+        """Min-max normalize raw scores for display while preserving raw ranking."""
+        values = [
+            value for row in rows
+            if (value := AShareCoarseScanner._number(row.get("raw_coarse_score"))) is not None
+        ]
+        if not values:
+            return
+        low, high = min(values), max(values)
+        for row in rows:
+            raw = AShareCoarseScanner._number(row.get("raw_coarse_score"))
+            if raw is None:
+                display = None
+            elif math.isclose(high, low):
+                display = 50.0
+            else:
+                display = round(clip((raw - low) / (high - low) * 100.0, 0.0, 100.0), 4)
+            row["display_coarse_score"] = display
+            # Keep the original public column as the display score for compatibility.
+            row["coarse_score"] = display
+
+    @staticmethod
+    def _candidate_bucket(row: dict[str, Any]) -> str:
+        decision = str(row.get("quant_decision") or "")
+        risk = float(row.get("risk_score") or 0.0)
+        overheat = float(row.get("overheat_score") or 0.0)
+        return_5d = AShareCoarseScanner._number(row.get("return_5d")) or 0.0
+        return_20d = AShareCoarseScanner._number(row.get("return_20d")) or 0.0
+        risk_flags = set(row.get("risk_flags") or [])
+        low_risk_disqualifiers = {
+            "high_5d_gain",
+            "extreme_5d_gain",
+            "high_20d_gain",
+            "extreme_20d_gain",
+            "high_overheat",
+            "high_risk_score",
+            "high_amount_surge",
+        }
+        if return_5d > 0.15 or return_20d > 0.30:
+            return "avoid_chasing"
+        if decision == "support" and (risk > 55.0 or overheat > 50.0):
+            return "high_risk_momentum"
+        if (
+            decision == "support"
+            and risk < 40.0
+            and overheat < 40.0
+            and return_5d <= 0.08
+            and return_20d <= 0.18
+            and not risk_flags.intersection(low_risk_disqualifiers)
+        ):
+            return "low_risk_watch"
+        return "momentum_watch"
 
     @staticmethod
     def _risk_flags(features, scores) -> list[str]:
         flags: list[str] = []
+        if features.return_5d is not None and features.return_5d > 0.08:
+            flags.append("high_5d_gain")
+        if features.return_5d is not None and features.return_5d > 0.12:
+            flags.append("extreme_5d_gain")
+        if features.return_20d is not None and features.return_20d > 0.18:
+            flags.append("high_20d_gain")
+        if features.return_20d is not None and features.return_20d > 0.25:
+            flags.append("extreme_20d_gain")
+        if scores.risk_score > 55:
+            flags.append("high_risk_score")
+        if scores.risk_score > 65:
+            flags.append("extreme_risk_score")
+        if scores.overheat_score > 50:
+            flags.append("high_overheat")
+        if features.amount_ratio_5d is not None and features.amount_ratio_5d > 2.5:
+            flags.append("high_amount_surge")
         if scores.risk_score >= 75:
             flags.append("high_risk")
         if scores.overheat_score >= 75:
@@ -460,7 +560,12 @@ class AShareCoarseScanner:
 
     @staticmethod
     def _sort_key(row: dict[str, Any]) -> tuple[float, float]:
-        return float(row.get("coarse_score") or -1.0), float(row.get("quant_score") or -1.0)
+        raw = AShareCoarseScanner._number(row.get("raw_coarse_score"))
+        quant = AShareCoarseScanner._number(row.get("quant_score"))
+        return (
+            raw if raw is not None else float("-inf"),
+            quant if quant is not None else float("-inf"),
+        )
 
     @staticmethod
     def _number(value: Any) -> float | None:

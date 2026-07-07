@@ -344,6 +344,7 @@ with tab_scan:
         m2.metric("已完成量化", scan_result.get("scanned_count", 0))
         m3.metric("已排除", scan_result.get("excluded_count", 0))
         m4.metric("最新交易日", scan_result.get("latest_as_of_date") or "-")
+        st.caption(f"候选分组：{scan_result.get('candidate_bucket_counts') or {}}")
 
         def scan_frame(values):
             rows = []
@@ -351,8 +352,10 @@ with tab_scan:
                 rows.append({
                     "rank": item.get("rank"),
                     "股票": f"{item.get('symbol')} {item.get('stock_name') or '未知名称'}",
+                    "候选类型": item.get("candidate_bucket") or "未分组",
                     "当前价": item.get("current_price"),
-                    "coarse_score": item.get("coarse_score"),
+                    "原始粗扫分": item.get("raw_coarse_score"),
+                    "展示粗扫分": item.get("coarse_score"),
                     "quant_score": item.get("quant_score"),
                     "quant_decision": item.get("quant_decision"),
                     "近 5 日涨跌": _pct(item.get("return_5d")),
@@ -360,20 +363,56 @@ with tab_scan:
                     "risk_score": item.get("risk_score"),
                     "overheat_score": item.get("overheat_score"),
                     "5 日成交额倍数": item.get("amount_ratio_5d"),
-                    "risk_flags": "；".join(item.get("risk_flags") or []),
+                    "风险标签": "；".join(item.get("risk_flags") or []) or "无",
                 })
             return pd.DataFrame(rows)
 
-        st.markdown("#### Top candidates")
         top_values = scan_result.get("top_candidates") or []
-        if top_values:
-            st.dataframe(scan_frame(top_values), use_container_width=True, hide_index=True)
+        bucket_values = scan_result.get("bucket_candidates") or {}
+        low_risk_values = bucket_values.get("low_risk_watch") or [
+            item for item in top_values if item.get("candidate_bucket") == "low_risk_watch"
+        ]
+        momentum_values = bucket_values.get("momentum_watch") or [
+            item for item in top_values if item.get("candidate_bucket") == "momentum_watch"
+        ]
+        chasing_values = (
+            (bucket_values.get("high_risk_momentum") or [])
+            + (bucket_values.get("avoid_chasing") or [])
+        ) or [
+            item for item in top_values
+            if item.get("candidate_bucket") in {"high_risk_momentum", "avoid_chasing"}
+        ]
+        ungrouped_values = [
+            item for item in top_values
+            if item.get("candidate_bucket") not in {
+                "low_risk_watch", "momentum_watch", "high_risk_momentum", "avoid_chasing"
+            }
+        ]
+
+        st.markdown("#### 低风险观察候选（优先展示）")
+        if low_risk_values:
+            st.dataframe(scan_frame(low_risk_values), use_container_width=True, hide_index=True)
         else:
-            st.info("当前筛选条件下没有 Top candidates。")
+            st.info("当前 Top 结果中没有 low_risk_watch。")
+
+        if momentum_values or ungrouped_values:
+            st.markdown("#### 动量观察候选")
+            st.dataframe(
+                scan_frame(momentum_values + ungrouped_values),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("#### 强势但追高 / 高风险候选")
+        if chasing_values:
+            st.warning("以下标的虽然动量较强，但涨幅、风险或过热指标已触发风险标签，不建议直接追高。")
+            st.dataframe(scan_frame(chasing_values), use_container_width=True, hide_index=True)
+        else:
+            st.caption("当前 Top 结果中没有 high_risk_momentum 或 avoid_chasing。")
 
         risk_values = scan_result.get("risk_candidates") or []
         if risk_values:
-            st.markdown("#### Risk candidates")
+            st.markdown("#### 全部已标记风险候选")
             st.dataframe(scan_frame(risk_values), use_container_width=True, hide_index=True)
 
         st.markdown("#### 排除原因汇总")
