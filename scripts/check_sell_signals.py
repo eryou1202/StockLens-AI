@@ -8,6 +8,7 @@ from rich.table import Table
 from src.ai.file_ai_info_engine import FileAIInfoEngine
 from src.config.settings import load_settings
 from src.data.provider_factory import create_market_data_provider
+from src.data.realtime_quote_provider import RealtimeQuoteProvider
 from src.data.symbol_name_resolver import SymbolNameResolver
 from src.decision.decision_engine import DecisionEngine
 from src.models.schemas import AICandidate
@@ -40,6 +41,8 @@ def build_open_position_sell_signals(
         cache_dir=settings.cache_dir,
         use_cache=bool(use_cache and not force_refresh),
     )
+    quote_provider = RealtimeQuoteProvider(cache_seconds=30)
+    quotes = quote_provider.get_all_quotes(force_refresh=force_refresh)
     quant_engine, decision_engine, sell_engine = RuleBasedQuantEngine(), DecisionEngine(), SellSignalEngine()
     results: list[Recommendation] = []
     for position in positions:
@@ -63,7 +66,12 @@ def build_open_position_sell_signals(
             position.symbol, now - timedelta(days=settings.default_lookback_days), now,
             settings.market_frequency, settings.market_adjust_type,
         )
-        current_price, price_time = _latest_market_price(market_data)
+        latest_bar = _latest_market_bar(market_data)
+        price = quote_provider.get_current_price(
+            position.symbol,
+            latest_market_bar=latest_bar,
+            quotes=quotes,
+        )
         if not position.stock_name:
             inferred = _infer_stock_name(market_data)
             if inferred and position.id:
@@ -74,25 +82,30 @@ def build_open_position_sell_signals(
             sell_engine.build_sell_signal(
                 position,
                 decision,
-                current_price=current_price,
-                price_time=price_time,
-                price_source="latest_market_bar" if current_price is not None else "unavailable",
+                current_price=price.current_price,
+                price_time=price.price_time.isoformat() if price.price_time else None,
+                price_source=price.price_source,
+                is_realtime=price.is_realtime,
+                is_stale=price.is_stale,
+                realtime_source=price.realtime_source,
+                realtime_pct_change=price.realtime_pct_change,
+                price_warning=price.warning,
                 require_fresh_price=True,
             )
         )
     return results
 
 
-def _latest_market_price(bundle) -> tuple[float | None, str | None]:
-    """Return the newest valid close from this fetch, never from old recommendations."""
+def _latest_market_bar(bundle):
+    """Return the newest valid daily bar as an explicit non-realtime fallback."""
     for bar in reversed(bundle.sorted_bars()):
         try:
             close = float(bar.close)
         except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(close) and close > 0:
-            return close, bar.trade_time.isoformat()
-    return None, None
+            return bar
+    return None
 
 
 def _infer_stock_name(bundle) -> str | None:
@@ -124,7 +137,10 @@ def main() -> None:
         print("当前没有 open 持仓或 watch_only 观察股。")
         return
     table = Table(title="StockLens 持仓/观察提醒（不构成自动交易指令）")
-    for column in ("股票", "status", "action", "level", "当前价", "价格时间", "成本价", "浮动收益", "触发规则", "主要理由"):
+    for column in (
+        "股票", "status", "action", "level", "当前价", "价格时间", "价格来源",
+        "是否实时", "成本价", "浮动收益", "触发规则", "主要理由",
+    ):
         table.add_column(column)
     for item in signals:
         meta = item.metadata
@@ -133,6 +149,8 @@ def main() -> None:
             ACTION_LABELS[item.action], item.action_level.value,
             "未获取" if meta.get("current_price") is None else f"{meta['current_price']:.2f}",
             str(meta.get("price_time") or "未获取"),
+            str(meta.get("price_source") or "未获取"),
+            "是" if meta.get("is_realtime") else "否（仅最新日线）",
             "-" if meta.get("is_watch_only") else f"{meta['entry_price']:.2f}",
             "-" if meta.get("unrealized_return") is None else f"{meta['unrealized_return']:.2%}",
             "；".join(meta.get("triggered_rule_labels", [])), "；".join(item.reason),

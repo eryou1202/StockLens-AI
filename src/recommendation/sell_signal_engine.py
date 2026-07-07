@@ -16,6 +16,11 @@ class SellSignalEngine:
         current_price: float | None = None,
         price_time: str | None = None,
         price_source: str | None = None,
+        is_realtime: bool = False,
+        is_stale: bool = True,
+        realtime_source: str | None = None,
+        realtime_pct_change: float | None = None,
+        price_warning: str | None = None,
         require_fresh_price: bool = False,
     ) -> Recommendation:
         context = RecommendationEngine.extract_quant_context(decision)
@@ -42,6 +47,12 @@ class SellSignalEngine:
             "current_price": current_price, "unrealized_return": None, "triggered_rules": [],
             "price_time": price_time,
             "price_source": resolved_price_source,
+            "is_realtime": bool(is_realtime),
+            "is_stale": bool(is_stale),
+            "realtime_price": current_price if is_realtime else None,
+            "realtime_source": realtime_source,
+            "realtime_pct_change": realtime_pct_change,
+            "price_warning": price_warning,
             **context,
         }
 
@@ -200,6 +211,15 @@ class SellSignalEngine:
     @staticmethod
     def _result(position: Position, decision: FinalDecision, action: RecommendationAction,
                 level: ActionLevel, reasons: list[str], risks: list[str], metadata: dict) -> Recommendation:
+        reasons = list(reasons)
+        risks = list(risks)
+        if metadata.get("price_source") == "latest_market_bar":
+            notice = "当前价格为非实时数据，仅代表最新完整日线收盘价。"
+            if notice not in reasons:
+                reasons.append(notice)
+        warning = metadata.get("price_warning")
+        if warning and warning not in risks:
+            risks.append(str(warning))
         confidence = {
             RecommendationAction.STOP_LOSS: .95, RecommendationAction.TAKE_PROFIT: .85,
             RecommendationAction.REDUCE: .75, RecommendationAction.SELL_ALERT: .75,

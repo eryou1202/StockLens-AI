@@ -28,7 +28,8 @@ from src.portfolio.position_manager import PositionManager
 from src.portfolio.position_schema import Position, PositionStatus
 from src.recommendation.candidate_pool import CandidatePoolEditor
 from src.recommendation.recommendation_explainer import ACTION_LABELS, RecommendationExplainer
-from src.recommendation.recommendation_schema import Recommendation
+from src.recommendation.recommendation_schema import Recommendation, RecommendationAction
+from src.scan.a_share_coarse_scanner import AShareCoarseScanner
 from src.tracking.recommendation_tracker import RecommendationTracker
 from src.tracking.tracking_schema import ManualVerdict
 
@@ -73,14 +74,34 @@ def _run_recommendations(save: bool = False) -> None:
 
 
 def _recommendation_rows(items: list[Recommendation]) -> list[dict]:
-    return [{
-        "股票代码": item.symbol, "股票名称": item.stock_name or "未知名称",
-        "source_type": item.source_type, "action": ACTION_LABELS[item.action],
-        "action_level": item.action_level.value, "confidence": f"{item.confidence:.2%}",
-        "ai_view": item.ai_view, "quant_decision": item.quant_decision,
-        "final_score": "-" if item.final_score is None else f"{item.final_score:.2f}",
-        "结论与原因": "；".join(item.reason), "风险点": "；".join(item.risks),
-    } for item in items]
+    rows: list[dict] = []
+    for item in items:
+        meta = item.metadata
+        original_action = meta.get("original_action")
+        try:
+            original_label = ACTION_LABELS[RecommendationAction(original_action)]
+        except (TypeError, ValueError, KeyError):
+            original_label = str(original_action or "-")
+        rows.append({
+            "股票代码": item.symbol,
+            "股票名称": item.stock_name or "未知名称",
+            "source_type": item.source_type,
+            "数据类型": "实时行情" if meta.get("is_realtime") else "非实时 / 昨日收盘数据",
+            "实时价": "-" if meta.get("realtime_price") is None else f"{meta['realtime_price']:.2f}",
+            "实时涨跌幅": _pct(meta.get("realtime_pct_change")),
+            "盘中确认": "是" if meta.get("intraday_confirmed") else "否",
+            "原始动作": original_label,
+            "当前动作": ACTION_LABELS[item.action],
+            "action_level": item.action_level.value,
+            "confidence": f"{item.confidence:.2%}",
+            "ai_view": item.ai_view,
+            "quant_decision": item.quant_decision,
+            "final_score": "-" if item.final_score is None else f"{item.final_score:.2f}",
+            "数据时间": meta.get("price_time") or "未获取",
+            "结论与原因": "；".join(item.reason),
+            "风险点": "；".join(item.risks),
+        })
+    return rows
 
 
 def _position_rows(items: list[Position]) -> list[dict]:
@@ -153,7 +174,7 @@ def _show_audit_summary(summary: AuditSummary, export_paths: dict | None = None)
         st.code("\n".join(f"{name}: {path}" for name, path in export_paths.items()))
 
 
-st.title("📈 StockLens AI 本地控制台 · MVP v1.1.1")
+st.title("📈 StockLens AI 本地控制台 · MVP v1.2")
 st.warning("仅用于研究和辅助决策，不构成投资建议。所有买入、卖出、持有输出均为候选或提醒。")
 
 with st.sidebar:
@@ -169,8 +190,8 @@ with st.sidebar:
         st.session_state["data_output"] = _run_module("scripts.dataset_status")
     st.caption("本地应用不会联网爬新闻、自动交易或连接券商。")
 
-tab_recommend, tab_positions, tab_sell, tab_tracking, tab_data, tab_diagnostics, tab_audit = st.tabs([
-    "候选股推荐", "持仓 / 观察管理", "卖出提醒", "追踪复盘", "数据与反馈", "诊断工具", "算法审查"
+tab_recommend, tab_scan, tab_positions, tab_sell, tab_tracking, tab_data, tab_diagnostics, tab_audit = st.tabs([
+    "候选股推荐", "A 股粗扫", "持仓 / 观察管理", "卖出提醒", "追踪复盘", "数据与反馈", "诊断工具", "算法审查"
 ])
 
 with tab_recommend:
@@ -228,7 +249,7 @@ with tab_recommend:
                 st.error(f"JSON 保存失败：{exc}")
 
     c1, c2 = st.columns(2)
-    if c1.button("运行候选股分析", type="primary", use_container_width=True):
+    if c1.button("刷新推荐池（含盘中确认）", type="primary", use_container_width=True):
         try:
             _run_recommendations(False)
         except Exception as exc:
@@ -244,6 +265,148 @@ with tab_recommend:
         for item in recommendations:
             with st.expander(f"{ACTION_LABELS[item.action]} · {item.symbol} {item.stock_name or '未知名称'} · {item.source_type}"):
                 st.text(RecommendationExplainer.format_report(item))
+
+with tab_scan:
+    st.subheader("A 股量化粗扫")
+    st.info(
+        "这是使用现有 RuleScorer 的第一层技术粗筛，不使用 ML、ResearchModelRegistry 或研究模型；"
+        "结果仅写入 data/scans/，不会自动修改候选池、持仓、追踪或反馈。"
+    )
+    with st.form("a_share_coarse_scan_form"):
+        scan_scope = st.radio(
+            "扫描范围",
+            ["全 A 股 stock-only", "指定 symbols-file"],
+            horizontal=True,
+        )
+        scan_symbols_file = st.text_input(
+            "symbols-file",
+            value="data/universe/liquid100.txt",
+            disabled=scan_scope == "全 A 股 stock-only",
+        )
+        s1, s2, s3 = st.columns(3)
+        scan_max_symbols = s1.number_input("max-symbols（0 表示不限）", min_value=0, value=0, step=10)
+        scan_limit = s2.number_input("输出数量 limit", min_value=1, value=50, step=5)
+        scan_min_amount = s3.number_input(
+            "最低 20 日平均成交额",
+            min_value=0.0,
+            value=30_000_000.0,
+            step=5_000_000.0,
+            format="%.0f",
+        )
+        scan_include_risky = st.checkbox("显示高风险候选", value=False)
+        run_scan = st.form_submit_button("开始粗扫", type="primary")
+
+    if run_scan:
+        progress_bar = st.progress(0.0)
+        progress_text = st.empty()
+
+        def update_scan_progress(symbol, completed, total, status):
+            progress_bar.progress(completed / max(total, 1))
+            progress_text.caption(f"{completed}/{total} · {symbol} · {status}")
+
+        try:
+            scanner = AShareCoarseScanner(SETTINGS, progress_callback=update_scan_progress)
+            with st.spinner("正在执行规则量化粗扫；全 A 股首次扫描可能耗时较久..."):
+                scan_result = scanner.run(
+                    symbols_file=(
+                        scan_symbols_file.strip()
+                        if scan_scope == "指定 symbols-file" and scan_symbols_file.strip()
+                        else None
+                    ),
+                    max_symbols=int(scan_max_symbols) or None,
+                    limit=int(scan_limit),
+                    min_avg_amount_20d=float(scan_min_amount),
+                    include_risky=scan_include_risky,
+                )
+                scan_paths = scanner.save_results(scan_result, "data/scans", True, True)
+            st.session_state["coarse_scan_result"] = {
+                key: value for key, value in scan_result.items() if key != "all_results"
+            }
+            st.session_state["coarse_scan_paths"] = scan_paths
+            st.success("A 股规则量化粗扫完成；未使用 ML，也未自动写入候选池。")
+        except Exception as exc:
+            st.error(f"粗扫失败：{type(exc).__name__}: {exc}")
+
+    if st.button("读取最近一次粗扫结果", use_container_width=True):
+        try:
+            st.session_state["coarse_scan_result"] = AShareCoarseScanner.load_latest("data/scans")
+            st.session_state["coarse_scan_paths"] = {
+                "latest_json": "data/scans/a_share_coarse_scan_latest.json",
+                "latest_csv": "data/scans/a_share_coarse_scan_latest.csv",
+            }
+        except Exception as exc:
+            st.error(f"读取失败：{type(exc).__name__}: {exc}")
+
+    scan_result = st.session_state.get("coarse_scan_result")
+    if scan_result:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("股票池", scan_result.get("universe_count", 0))
+        m2.metric("已完成量化", scan_result.get("scanned_count", 0))
+        m3.metric("已排除", scan_result.get("excluded_count", 0))
+        m4.metric("最新交易日", scan_result.get("latest_as_of_date") or "-")
+
+        def scan_frame(values):
+            rows = []
+            for item in values or []:
+                rows.append({
+                    "rank": item.get("rank"),
+                    "股票": f"{item.get('symbol')} {item.get('stock_name') or '未知名称'}",
+                    "当前价": item.get("current_price"),
+                    "coarse_score": item.get("coarse_score"),
+                    "quant_score": item.get("quant_score"),
+                    "quant_decision": item.get("quant_decision"),
+                    "近 5 日涨跌": _pct(item.get("return_5d")),
+                    "近 20 日涨跌": _pct(item.get("return_20d")),
+                    "risk_score": item.get("risk_score"),
+                    "overheat_score": item.get("overheat_score"),
+                    "5 日成交额倍数": item.get("amount_ratio_5d"),
+                    "risk_flags": "；".join(item.get("risk_flags") or []),
+                })
+            return pd.DataFrame(rows)
+
+        st.markdown("#### Top candidates")
+        top_values = scan_result.get("top_candidates") or []
+        if top_values:
+            st.dataframe(scan_frame(top_values), use_container_width=True, hide_index=True)
+        else:
+            st.info("当前筛选条件下没有 Top candidates。")
+
+        risk_values = scan_result.get("risk_candidates") or []
+        if risk_values:
+            st.markdown("#### Risk candidates")
+            st.dataframe(scan_frame(risk_values), use_container_width=True, hide_index=True)
+
+        st.markdown("#### 排除原因汇总")
+        st.json(scan_result.get("excluded_summary") or {})
+        if st.session_state.get("coarse_scan_paths"):
+            st.caption("；".join(
+                f"{name}: {path}"
+                for name, path in st.session_state["coarse_scan_paths"].items()
+            ))
+
+        st.markdown("#### 手动加入观察池")
+        if top_values:
+            top_map = {item["symbol"]: item for item in top_values}
+            selected_scan_symbol = st.selectbox("选择粗扫候选", list(top_map))
+            selected_scan = top_map[selected_scan_symbol]
+            if st.button("将所选股票加入人工观察池"):
+                try:
+                    POOL.add_manual_watch(
+                        selected_scan_symbol,
+                        selected_scan.get("stock_name"),
+                        f"A 股粗扫观察，coarse_score={selected_scan.get('coarse_score')}",
+                        [3, 5, 10],
+                        metadata={
+                            "source": "a_share_coarse_scan",
+                            "candidate_type": "coarse_scan_watch",
+                            "coarse_score": selected_scan.get("coarse_score"),
+                        },
+                    )
+                    st.success("已按 manual_watch 加入观察池；不会直接形成买入候选。")
+                except Exception as exc:
+                    st.error(f"加入观察池失败：{exc}")
+        else:
+            st.caption("暂无可加入观察池的粗扫候选。")
 
 with tab_positions:
     st.subheader("持仓 / 观察管理")
@@ -339,7 +502,7 @@ with tab_positions:
 
 with tab_sell:
     st.subheader("卖出提醒与观察风险")
-    st.caption("当前价格来自最新可用行情；如果行情源为日线，则不是盘中实时价。")
+    st.caption("当前价格优先来自实时行情；若实时接口不可用，会明确标注为“非实时，仅最新日线”。")
     if st.button("检查卖出提醒", type="primary"):
         # Never render a previous check while a new refresh is running or after it fails.
         st.session_state.pop("sell_signals", None)
@@ -368,6 +531,8 @@ with tab_sell:
                 "current_price": "未获取" if meta.get("current_price") is None else f"{meta['current_price']:.2f}",
                 "price_time": meta.get("price_time") or "未获取",
                 "price_source": meta.get("price_source") or "未获取",
+                "is_realtime": bool(meta.get("is_realtime")),
+                "数据类型": "实时行情" if meta.get("is_realtime") else "非实时 / 仅最新日线",
                 "entry_price": "-" if meta.get("is_watch_only") else f"{meta['entry_price']:.2f}",
                 "unrealized_return_percent": "-" if meta.get("is_watch_only") else _pct(meta.get("unrealized_return")),
                 "triggered_rules": "；".join(meta.get("triggered_rule_labels", [])),

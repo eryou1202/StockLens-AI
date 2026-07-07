@@ -4,6 +4,8 @@ pydantic>=2.6.0
 PyYAML>=6.0.1
 rich>=13.7.0
 python-dotenv>=1.0.0
+scikit-learn>=1.4.0
+joblib>=1.3.0
 
 # Optional real data providers:
 # baostock>=0.8.9

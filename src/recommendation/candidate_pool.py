@@ -42,7 +42,8 @@ class CandidatePoolEditor:
 
     def add_manual_watch(self, symbol: str, stock_name: str | None = None,
                          notes: str | None = None,
-                         expected_horizon_days: list[int] | None = None) -> None:
+                         expected_horizon_days: list[int] | None = None,
+                         metadata: dict[str, Any] | None = None) -> None:
         package = self.load()
         normalized = SymbolMapper.normalize(symbol)
         if any(item.stock_code == normalized for item in package.candidates):
@@ -103,6 +104,7 @@ class CandidatePoolEditor:
                 "reason": "人工观察股仅使用量化趋势与风险作辅助跟踪。",
             }],
             "metadata": {
+                **(metadata or {}),
                 "source_type": "manual_watch",
                 "event_type": "manual_watch",
                 "manual_review_required": True,
