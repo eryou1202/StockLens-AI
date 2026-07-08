@@ -36,11 +36,14 @@ class MLTrainer:
 
         task = self._task_type(request.target)
         if task == "classification" and request.model_type != "logistic":
-            return {"status": "model_target_mismatch", "message": "hit target requires logistic model"}
+            return {
+                "status": "model_target_mismatch",
+                "message": "classification target requires logistic model",
+            }
         if task == "regression" and request.model_type != "random_forest_regressor":
             return {
                 "status": "model_target_mismatch",
-                "message": "future_return target requires random_forest_regressor",
+                "message": "regression target requires random_forest_regressor",
             }
         dates = pd.to_datetime(frame["as_of_date"], errors="coerce")
         target = pd.to_numeric(frame[request.target], errors="coerce")
@@ -137,11 +140,11 @@ class MLTrainer:
 
     @staticmethod
     def _task_type(target: str) -> str:
-        if target.startswith("hit_"):
+        if target.startswith(("hit_", "future_top30_", "future_bottom30_")):
             return "classification"
-        if target.startswith("future_return_"):
+        if target.startswith(("future_return_", "future_excess_return_", "future_rank_pct_")):
             return "regression"
-        raise ValueError("target must start with hit_ or future_return_")
+        raise ValueError("unsupported research target prefix")
 
     @staticmethod
     def _horizon(target: str) -> int | None:

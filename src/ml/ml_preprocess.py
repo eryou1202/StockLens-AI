@@ -10,7 +10,15 @@ class MLPreprocessor:
         "sample_id", "symbol", "stock_name", "as_of_date", "price_time", "current_price",
         "source", "sample_interval_days", "lookback_days", "label_status", "label_error",
     }
-    EXCLUDED_PREFIXES = ("future_return_", "hit_", "future_max_drawdown_")
+    EXCLUDED_PREFIXES = (
+        "future_return_",
+        "future_excess_return_",
+        "future_rank_pct_",
+        "future_top30_",
+        "future_bottom30_",
+        "hit_",
+        "future_max_drawdown_",
+    )
 
     def select_features(self, train_frame: pd.DataFrame, target: str) -> list[str]:
         columns: list[str] = []

@@ -49,6 +49,8 @@ class MLEvaluator:
 
         truth = pd.to_numeric(frame[target], errors="coerce").to_numpy(dtype=float)
         horizon = self._horizon(target)
+        return_column = f"future_return_{horizon}d" if horizon else None
+        returns = self._optional_numeric(frame, return_column)
         metrics: dict[str, Any] = {
             "task_type": "regression",
             "samples": int(len(frame)),
@@ -57,7 +59,7 @@ class MLEvaluator:
             "pearson_corr": self._correlation(predictions, truth, "pearson"),
             "spearman_corr": self._correlation(predictions, truth, "spearman"),
         }
-        metrics.update(self._ranking(predictions, pd.Series(truth, index=frame.index), frame, horizon))
+        metrics.update(self._ranking(predictions, returns, frame, horizon))
         return metrics
 
     def _ranking(
@@ -75,9 +77,18 @@ class MLEvaluator:
                 "middle60_avg_return": None,
                 "bottom20_avg_return": None,
                 "top_bottom_spread": None,
+                "top20_avg_excess_return": None,
+                "middle60_avg_excess_return": None,
+                "bottom20_avg_excess_return": None,
+                "top_bottom_excess_spread": None,
                 "buckets": [],
             }
+        excess_column = f"future_excess_return_{horizon}d" if horizon else None
+        excess_returns = self._optional_numeric(frame, excess_column)
         work = pd.DataFrame({"score": scores, "future_return": returns.to_numpy()}, index=frame.index)
+        work["future_excess_return"] = (
+            excess_returns.to_numpy() if excess_returns is not None else np.nan
+        )
         work = work.dropna(subset=["score", "future_return"]).sort_values("score", kind="stable")
         if work.empty:
             return self._ranking(np.array([]), None, frame, horizon)
@@ -102,6 +113,7 @@ class MLEvaluator:
                 "bucket": name,
                 "count": int(len(group)),
                 "avg_future_return": self._mean(group["future_return"]),
+                "avg_future_excess_return": self._mean(group["future_excess_return"]),
                 "median_future_return": self._median(group["future_return"]),
                 "hit_rate": self._mean((group["future_return"] > 0).astype(float)),
                 "avg_max_drawdown": self._mean(group["max_drawdown"]),
@@ -109,6 +121,8 @@ class MLEvaluator:
         by_name = {item["bucket"]: item for item in buckets}
         top = by_name["top20"]["avg_future_return"]
         bottom = by_name["bottom20"]["avg_future_return"]
+        top_excess = by_name["top20"]["avg_future_excess_return"]
+        bottom_excess = by_name["bottom20"]["avg_future_excess_return"]
         return {
             "pearson_corr_with_future_return": self._correlation(
                 work["score"].to_numpy(), work["future_return"].to_numpy(), "pearson"
@@ -120,6 +134,13 @@ class MLEvaluator:
             "middle60_avg_return": by_name["middle60"]["avg_future_return"],
             "bottom20_avg_return": bottom,
             "top_bottom_spread": None if top is None or bottom is None else top - bottom,
+            "top20_avg_excess_return": top_excess,
+            "middle60_avg_excess_return": by_name["middle60"]["avg_future_excess_return"],
+            "bottom20_avg_excess_return": bottom_excess,
+            "top_bottom_excess_spread": (
+                None if top_excess is None or bottom_excess is None
+                else top_excess - bottom_excess
+            ),
             "buckets": buckets,
         }
 

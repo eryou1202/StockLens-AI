@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.ml.ml_schema import CONTEXT_FEATURE_COLUMNS, MLResearchSample
+from src.ml.ml_relative_labels import RelativeTargetLabelBuilder
 
 
 class MLDatasetStore:
@@ -22,6 +23,7 @@ class MLDatasetStore:
             [sample.model_dump(mode="json", exclude={"metadata"}) for sample in samples],
             columns=columns,
         )
+        frame = RelativeTargetLabelBuilder.apply(frame)
         frame.to_csv(path, index=False, encoding="utf-8-sig")
         return frame
 

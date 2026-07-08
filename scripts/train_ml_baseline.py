@@ -29,6 +29,7 @@ def _print_metrics(metrics: dict) -> None:
             print(
                 f"  {bucket['bucket']}: count={bucket['count']}, "
                 f"avg_return={bucket['avg_future_return']}, "
+                f"avg_excess_return={bucket.get('avg_future_excess_return')}, "
                 f"hit_rate={bucket['hit_rate']}, avg_drawdown={bucket['avg_max_drawdown']}"
             )
 
