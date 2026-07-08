@@ -45,6 +45,7 @@ div[data-testid="stMetric"] {background:#f5f7fa;border:1px solid #e6e9ef;padding
 
 SETTINGS = load_settings(PROJECT_ROOT / "config" / "config.yaml")
 AI_FILE = PROJECT_ROOT / "data" / "ai_candidates.json"
+ML_SHADOW_FILE = PROJECT_ROOT / "data" / "ml" / "shadow_mode" / "ml_shadow_latest.csv"
 NAME_RESOLVER = SymbolNameResolver(SETTINGS.database_path, str(AI_FILE))
 POOL = CandidatePoolEditor(AI_FILE, NAME_RESOLVER)
 
@@ -120,6 +121,50 @@ def _pct(value: float | None) -> str:
     return "-" if value is None else f"{value:.2%}"
 
 
+SHADOW_RISK_LABELS = {
+    "low": "低风险",
+    "medium": "中等风险",
+    "high": "高风险",
+    "extreme": "极高风险",
+}
+
+
+def _shadow_display_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "ml_rank", "ml_bucket", "symbol", "stock_name", "ml_score",
+        "shadow_risk_level", "shadow_risk_tags", "shadow_interpretation",
+        "quant_score", "return_5d", "return_20d", "risk_score",
+        "overheat_score", "breadth_up_ratio_5d", "breadth_above_ma20_ratio",
+        "shadow_action",
+    ]
+    display = frame.reindex(columns=columns).copy()
+    display["shadow_risk_level"] = display["shadow_risk_level"].map(
+        SHADOW_RISK_LABELS
+    ).fillna("未知风险")
+    for column in ("return_5d", "return_20d"):
+        display[column] = display[column].apply(
+            lambda value: "-" if pd.isna(value) else f"{float(value):.2%}"
+        )
+    for column in (
+        "ml_score", "quant_score", "risk_score", "overheat_score",
+        "breadth_up_ratio_5d", "breadth_above_ma20_ratio",
+    ):
+        display[column] = pd.to_numeric(display[column], errors="coerce").round(4)
+    return display
+
+
+def _show_shadow_table(title: str, frame: pd.DataFrame, empty_text: str) -> None:
+    st.markdown(f"#### {title}")
+    if frame.empty:
+        st.info(empty_text)
+    else:
+        st.dataframe(
+            _shadow_display_frame(frame),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def _tracking_rows(items) -> list[dict]:
     return [{
         "id": item.id, "股票代码": item.symbol, "股票名称": item.stock_name or "未知名称",
@@ -190,8 +235,8 @@ with st.sidebar:
         st.session_state["data_output"] = _run_module("scripts.dataset_status")
     st.caption("本地应用不会联网爬新闻、自动交易或连接券商。")
 
-tab_recommend, tab_scan, tab_positions, tab_sell, tab_tracking, tab_data, tab_diagnostics, tab_audit = st.tabs([
-    "候选股推荐", "A 股粗扫", "持仓 / 观察管理", "卖出提醒", "追踪复盘", "数据与反馈", "诊断工具", "算法审查"
+tab_recommend, tab_scan, tab_ml_shadow, tab_positions, tab_sell, tab_tracking, tab_data, tab_diagnostics, tab_audit = st.tabs([
+    "候选股推荐", "A 股粗扫", "ML 影子榜单", "持仓 / 观察管理", "卖出提醒", "追踪复盘", "数据与反馈", "诊断工具", "算法审查"
 ])
 
 with tab_recommend:
@@ -446,6 +491,147 @@ with tab_scan:
                     st.error(f"加入观察池失败：{exc}")
         else:
             st.caption("暂无可加入观察池的粗扫候选。")
+
+with tab_ml_shadow:
+    st.subheader("ML 影子榜单")
+    st.error("Research-only：ML 影子榜单仅用于研究观察，不参与正式推荐，不构成买入建议。")
+    if not ML_SHADOW_FILE.exists():
+        st.info("尚未生成 ML 影子榜单，请先运行 scripts.generate_ml_shadow_signals。")
+    else:
+        try:
+            shadow_frame = pd.read_csv(ML_SHADOW_FILE, encoding="utf-8-sig")
+            required_shadow_columns = {
+                "as_of_date", "ml_rank", "ml_bucket", "symbol", "ml_score",
+                "shadow_risk_level", "shadow_risk_tags", "shadow_interpretation",
+            }
+            missing_shadow_columns = sorted(
+                required_shadow_columns.difference(shadow_frame.columns)
+            )
+            if missing_shadow_columns:
+                st.error(f"ML 影子榜单缺少字段：{missing_shadow_columns}")
+            else:
+                shadow_frame["ml_rank"] = pd.to_numeric(
+                    shadow_frame["ml_rank"], errors="coerce"
+                )
+                shadow_frame["ml_score"] = pd.to_numeric(
+                    shadow_frame["ml_score"], errors="coerce"
+                )
+                high_or_extreme = shadow_frame["shadow_risk_level"].isin(
+                    ["high", "extreme"]
+                )
+                cumulative_top10 = shadow_frame["ml_bucket"].eq("top10")
+                cumulative_top20 = shadow_frame["ml_bucket"].isin(["top10", "top20"])
+                cumulative_top50 = shadow_frame["ml_bucket"].isin(
+                    ["top10", "top20", "top50"]
+                )
+                risk_counts = {
+                    level: int(shadow_frame["shadow_risk_level"].eq(level).sum())
+                    for level in ("low", "medium", "high", "extreme")
+                }
+                latest_as_of = str(shadow_frame["as_of_date"].max())
+                metrics = st.columns(5)
+                metrics[0].metric("as_of_date", latest_as_of)
+                metrics[1].metric("总样本数", len(shadow_frame))
+                metrics[2].metric(
+                    "累计 Top10 高/极高风险",
+                    int((cumulative_top10 & high_or_extreme).sum()),
+                )
+                metrics[3].metric(
+                    "累计 Top20 高/极高风险",
+                    int((cumulative_top20 & high_or_extreme).sum()),
+                )
+                metrics[4].metric(
+                    "累计 Top50 高/极高风险",
+                    int((cumulative_top50 & high_or_extreme).sum()),
+                )
+                st.markdown("#### 整体风险分布")
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "risk_level": SHADOW_RISK_LABELS[level],
+                            "count": risk_counts[level],
+                        }
+                        for level in ("low", "medium", "high", "extreme")
+                    ]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                if risk_counts["extreme"]:
+                    st.error(f"当前影子榜单包含 {risk_counts['extreme']} 条极高风险记录。")
+                if risk_counts["high"]:
+                    st.warning(f"当前影子榜单包含 {risk_counts['high']} 条高风险记录。")
+
+                filter_columns = st.columns(4)
+                risk_options = [
+                    level for level in ("low", "medium", "high", "extreme")
+                    if level in set(shadow_frame["shadow_risk_level"].dropna())
+                ]
+                selected_risks = filter_columns[0].multiselect(
+                    "risk_level",
+                    risk_options,
+                    default=risk_options,
+                    format_func=lambda value: SHADOW_RISK_LABELS.get(value, value),
+                )
+                bucket_options = [
+                    bucket for bucket in ("top10", "top20", "top50", "outside_top50")
+                    if bucket in set(shadow_frame["ml_bucket"].dropna())
+                ]
+                selected_buckets = filter_columns[1].multiselect(
+                    "ml_bucket", bucket_options, default=bucket_options
+                )
+                minimum_score = filter_columns[2].slider(
+                    "最低 ml_score", min_value=0.0, max_value=1.0,
+                    value=0.0, step=0.01,
+                )
+                hide_extreme = filter_columns[3].checkbox("隐藏 extreme", value=False)
+
+                filtered_shadow = shadow_frame.loc[
+                    shadow_frame["shadow_risk_level"].isin(selected_risks)
+                    & shadow_frame["ml_bucket"].isin(selected_buckets)
+                    & shadow_frame["ml_score"].ge(minimum_score)
+                ].copy()
+                if hide_extreme:
+                    filtered_shadow = filtered_shadow.loc[
+                        filtered_shadow["shadow_risk_level"].ne("extreme")
+                    ]
+                # Preserve the file's original ML ranking; filters never rerank.
+                filtered_shadow = filtered_shadow.sort_values(
+                    "ml_rank", ascending=True, kind="stable"
+                )
+                st.caption(
+                    "分桶为非重叠区间：累计 Top20 = top10 + top20；"
+                    "累计 Top50 = top10 + top20 + top50。筛选仅影响显示，不改变 ML 排名。"
+                )
+                _show_shadow_table(
+                    "Top10 高置信影子观察",
+                    filtered_shadow.loc[filtered_shadow["ml_bucket"].eq("top10")],
+                    "当前筛选条件下没有 Top10 影子记录。",
+                )
+                _show_shadow_table(
+                    "Top20 重点影子观察（第 11～20 档）",
+                    filtered_shadow.loc[filtered_shadow["ml_bucket"].eq("top20")],
+                    "当前筛选条件下没有 Top20 增量影子记录。",
+                )
+                _show_shadow_table(
+                    "Top50 宽影子观察（第 21～50 档）",
+                    filtered_shadow.loc[filtered_shadow["ml_bucket"].eq("top50")],
+                    "当前筛选条件下没有 Top50 增量影子记录。",
+                )
+                with st.expander("Outside Top50（默认折叠）"):
+                    outside = filtered_shadow.loc[
+                        filtered_shadow["ml_bucket"].eq("outside_top50")
+                    ]
+                    if outside.empty:
+                        st.info("当前筛选条件下没有 Outside Top50 记录。")
+                    else:
+                        st.dataframe(
+                            _shadow_display_frame(outside),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                st.caption(f"只读数据源：{ML_SHADOW_FILE}")
+        except Exception as exc:
+            st.error(f"读取 ML 影子榜单失败：{type(exc).__name__}: {exc}")
 
 with tab_positions:
     st.subheader("持仓 / 观察管理")
