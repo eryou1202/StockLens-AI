@@ -16,6 +16,17 @@ OUTCOME_COLUMNS = [
 ]
 
 
+def _read_research_dataset(path: Path) -> pd.DataFrame:
+    header = pd.read_csv(path, encoding="utf-8-sig", nrows=0)
+    dtype = {"label_error": "string"} if "label_error" in header.columns else None
+    return pd.read_csv(
+        path,
+        encoding="utf-8-sig",
+        low_memory=False,
+        dtype=dtype,
+    )
+
+
 def _number(value: Any) -> float | None:
     try:
         result = float(value)
@@ -115,7 +126,7 @@ def main() -> None:
     if not dataset_path.exists():
         parser.error(f"dataset not found: {dataset_path}")
     history = pd.read_csv(history_path, encoding="utf-8-sig")
-    dataset = pd.read_csv(dataset_path, encoding="utf-8-sig")
+    dataset = _read_research_dataset(dataset_path)
     required_history = {
         "as_of_date", "symbol", "ml_bucket", "shadow_risk_level", "shadow_action"
     }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -46,6 +47,12 @@ div[data-testid="stMetric"] {background:#f5f7fa;border:1px solid #e6e9ef;padding
 SETTINGS = load_settings(PROJECT_ROOT / "config" / "config.yaml")
 AI_FILE = PROJECT_ROOT / "data" / "ai_candidates.json"
 ML_SHADOW_FILE = PROJECT_ROOT / "data" / "ml" / "shadow_mode" / "ml_shadow_latest.csv"
+ML_SHADOW_OUTCOME_SUMMARY_FILE = (
+    PROJECT_ROOT / "data" / "ml" / "shadow_mode" / "ml_shadow_outcome_summary.json"
+)
+ML_SHADOW_OUTCOMES_FILE = (
+    PROJECT_ROOT / "data" / "ml" / "shadow_mode" / "ml_shadow_outcomes.csv"
+)
 NAME_RESOLVER = SymbolNameResolver(SETTINGS.database_path, str(AI_FILE))
 POOL = CandidatePoolEditor(AI_FILE, NAME_RESOLVER)
 
@@ -162,6 +169,254 @@ def _show_shadow_table(title: str, frame: pd.DataFrame, empty_text: str) -> None
             _shadow_display_frame(frame),
             use_container_width=True,
             hide_index=True,
+        )
+
+
+OUTCOME_PERCENT_COLUMNS = {
+    "avg_return_1d",
+    "avg_return_3d",
+    "avg_return_5d",
+    "avg_return_10d",
+    "avg_excess_return_5d",
+    "avg_rank_pct_5d",
+    "hit_rate_5d",
+    "future_return_1d",
+    "future_return_3d",
+    "future_return_5d",
+    "future_return_10d",
+    "future_excess_return_5d",
+    "future_rank_pct_5d",
+}
+
+
+def _is_missing(value) -> bool:
+    return value is None or pd.isna(value)
+
+
+def _fmt_percent(value, missing: str = "-") -> str:
+    if _is_missing(value):
+        return missing
+    try:
+        return f"{float(value):.2%}"
+    except (TypeError, ValueError):
+        return missing
+
+
+def _fmt_count(value) -> str:
+    if _is_missing(value):
+        return "-"
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _outcome_summary_metric(summary: dict, key: str, *, percent: bool = False) -> str:
+    value = summary.get(key)
+    if percent:
+        return _fmt_percent(value)
+    return _fmt_count(value)
+
+
+def _outcome_aggregation_frame(records: list[dict]) -> pd.DataFrame:
+    frame = pd.DataFrame(records or [])
+    if frame.empty:
+        return frame
+    display = frame.copy()
+    for column in display.columns:
+        if column in OUTCOME_PERCENT_COLUMNS:
+            display[column] = display[column].apply(_fmt_percent)
+        elif column.endswith("_count") or column in {"total_signals", "pending_count"}:
+            display[column] = display[column].apply(_fmt_count)
+    return display
+
+
+def _shadow_outcome_detail_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "as_of_date",
+        "symbol",
+        "stock_name",
+        "ml_rank",
+        "ml_bucket",
+        "shadow_risk_level",
+        "ml_score",
+        "future_return_1d",
+        "future_return_3d",
+        "future_return_5d",
+        "future_return_10d",
+        "future_excess_return_5d",
+        "future_rank_pct_5d",
+        "hit_5d",
+        "outcome_status",
+    ]
+    display = frame.reindex(columns=columns).copy()
+    display["stock_name"] = display["stock_name"].fillna("未知名称").replace("", "未知名称")
+    display["shadow_risk_level"] = display["shadow_risk_level"].map(
+        SHADOW_RISK_LABELS
+    ).fillna(display["shadow_risk_level"]).fillna("未知风险")
+    display["ml_score"] = pd.to_numeric(display["ml_score"], errors="coerce").round(4)
+    display["ml_rank"] = pd.to_numeric(display["ml_rank"], errors="coerce").astype("Int64")
+    for column in (
+        "future_return_1d",
+        "future_return_3d",
+        "future_return_5d",
+        "future_return_10d",
+        "future_excess_return_5d",
+        "future_rank_pct_5d",
+    ):
+        display[column] = display[column].apply(lambda value: _fmt_percent(value, "pending"))
+    display["hit_5d"] = display["hit_5d"].apply(
+        lambda value: "pending" if _is_missing(value) else ("是" if float(value) >= 1 else "否")
+    )
+    display["outcome_status"] = display["outcome_status"].fillna("pending")
+    return display
+
+
+def _show_ml_shadow_outcome_section() -> None:
+    st.markdown("---")
+    with st.expander("ML 影子表现追踪", expanded=True):
+        st.error("Research-only：ML 影子表现仅用于研究复盘，不参与正式推荐，不构成买入建议。")
+
+        if not ML_SHADOW_OUTCOME_SUMMARY_FILE.exists() or not ML_SHADOW_OUTCOMES_FILE.exists():
+            st.info("尚未生成 ML 影子表现，请先运行 scripts.update_ml_shadow_outcomes。")
+            return
+
+        try:
+            summary = json.loads(ML_SHADOW_OUTCOME_SUMMARY_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:
+            st.error(f"读取 ML 影子表现 summary 失败：{type(exc).__name__}: {exc}")
+            return
+
+        pending_count = int(summary.get("pending_count") or 0)
+        completed_5d_count = int(summary.get("completed_5d_count") or 0)
+        if pending_count > 0:
+            st.warning("仍有 pending 信号，等待未来标签回填。")
+        if completed_5d_count < 1000:
+            st.warning("完成样本仍少，结论不稳定。")
+
+        count_metrics = st.columns(3)
+        count_metrics[0].metric("total_signals", _outcome_summary_metric(summary, "total_signals"))
+        count_metrics[1].metric(
+            "completed_5d_count",
+            _outcome_summary_metric(summary, "completed_5d_count"),
+        )
+        count_metrics[2].metric("pending_count", _outcome_summary_metric(summary, "pending_count"))
+
+        bucket_metrics = st.columns(3)
+        bucket_metrics[0].metric(
+            "top10_avg_return_5d",
+            _outcome_summary_metric(summary, "top10_avg_return_5d", percent=True),
+        )
+        bucket_metrics[0].metric(
+            "top10_hit_rate_5d",
+            _outcome_summary_metric(summary, "top10_hit_rate_5d", percent=True),
+        )
+        bucket_metrics[1].metric(
+            "top20_avg_return_5d",
+            _outcome_summary_metric(summary, "top20_avg_return_5d", percent=True),
+        )
+        bucket_metrics[1].metric(
+            "top20_hit_rate_5d",
+            _outcome_summary_metric(summary, "top20_hit_rate_5d", percent=True),
+        )
+        bucket_metrics[2].metric(
+            "top50_avg_return_5d",
+            _outcome_summary_metric(summary, "top50_avg_return_5d", percent=True),
+        )
+        bucket_metrics[2].metric(
+            "top50_hit_rate_5d",
+            _outcome_summary_metric(summary, "top50_hit_rate_5d", percent=True),
+        )
+
+        risk_metrics = st.columns(4)
+        for metric, key in zip(
+            risk_metrics,
+            (
+                "extreme_avg_return_5d",
+                "high_avg_return_5d",
+                "medium_avg_return_5d",
+                "low_avg_return_5d",
+            ),
+        ):
+            metric.metric(key, _outcome_summary_metric(summary, key, percent=True))
+
+        aggregations = summary.get("aggregations") or {}
+        for title, key in (
+            ("按 ml_bucket 聚合", "by_ml_bucket"),
+            ("按 shadow_risk_level 聚合", "by_shadow_risk_level"),
+            ("按 shadow_action 聚合", "by_shadow_action"),
+            ("按 as_of_date 聚合", "by_as_of_date"),
+        ):
+            st.markdown(f"#### {title}")
+            agg_frame = _outcome_aggregation_frame(aggregations.get(key, []))
+            if agg_frame.empty:
+                st.info(f"{title} 暂无数据。")
+            else:
+                st.dataframe(agg_frame, use_container_width=True, hide_index=True)
+
+        try:
+            outcome_frame = pd.read_csv(ML_SHADOW_OUTCOMES_FILE, encoding="utf-8-sig")
+        except Exception as exc:
+            st.error(f"读取 ML 影子表现明细失败：{type(exc).__name__}: {exc}")
+            return
+
+        st.markdown("#### 明细")
+        required_columns = {
+            "as_of_date", "symbol", "ml_rank", "ml_bucket", "shadow_risk_level",
+            "ml_score", "outcome_status",
+        }
+        missing_columns = sorted(required_columns.difference(outcome_frame.columns))
+        if missing_columns:
+            st.error(f"ML 影子表现明细缺少字段：{missing_columns}")
+            return
+
+        detail_filters = st.columns(4)
+        as_of_options = sorted(outcome_frame["as_of_date"].dropna().astype(str).unique())
+        selected_as_of_dates = detail_filters[0].multiselect(
+            "as_of_date", as_of_options, default=as_of_options
+        )
+        bucket_options = [
+            bucket for bucket in ("top10", "top20", "top50", "outside_top50")
+            if bucket in set(outcome_frame["ml_bucket"].dropna())
+        ]
+        selected_buckets = detail_filters[1].multiselect(
+            "ml_bucket", bucket_options, default=bucket_options
+        )
+        risk_options = [
+            level for level in ("low", "medium", "high", "extreme")
+            if level in set(outcome_frame["shadow_risk_level"].dropna())
+        ]
+        selected_risks = detail_filters[2].multiselect(
+            "shadow_risk_level",
+            risk_options,
+            default=risk_options,
+            format_func=lambda value: SHADOW_RISK_LABELS.get(value, value),
+        )
+        status_options = sorted(outcome_frame["outcome_status"].dropna().astype(str).unique())
+        selected_statuses = detail_filters[3].multiselect(
+            "outcome_status", status_options, default=status_options
+        )
+
+        filtered = outcome_frame.loc[
+            outcome_frame["as_of_date"].astype(str).isin(selected_as_of_dates)
+            & outcome_frame["ml_bucket"].isin(selected_buckets)
+            & outcome_frame["shadow_risk_level"].isin(selected_risks)
+            & outcome_frame["outcome_status"].astype(str).isin(selected_statuses)
+        ].copy()
+        filtered["ml_rank"] = pd.to_numeric(filtered["ml_rank"], errors="coerce")
+        filtered = filtered.sort_values(
+            ["as_of_date", "ml_rank"], ascending=[False, True], kind="stable"
+        )
+        if filtered.empty:
+            st.info("当前筛选条件下没有 ML 影子表现明细。")
+        else:
+            st.dataframe(
+                _shadow_outcome_detail_frame(filtered),
+                use_container_width=True,
+                hide_index=True,
+            )
+        st.caption(
+            f"只读数据源：{ML_SHADOW_OUTCOME_SUMMARY_FILE}；{ML_SHADOW_OUTCOMES_FILE}"
         )
 
 
@@ -632,6 +887,8 @@ with tab_ml_shadow:
                 st.caption(f"只读数据源：{ML_SHADOW_FILE}")
         except Exception as exc:
             st.error(f"读取 ML 影子榜单失败：{type(exc).__name__}: {exc}")
+
+    _show_ml_shadow_outcome_section()
 
 with tab_positions:
     st.subheader("持仓 / 观察管理")

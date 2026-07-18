@@ -29,6 +29,17 @@ def _date(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%d")
 
 
+def _read_research_dataset(path: Path) -> pd.DataFrame:
+    header = pd.read_csv(path, encoding="utf-8-sig", nrows=0)
+    dtype = {"label_error": "string"} if "label_error" in header.columns else None
+    return pd.read_csv(
+        path,
+        encoding="utf-8-sig",
+        low_memory=False,
+        dtype=dtype,
+    )
+
+
 def _number(value: Any) -> float | None:
     try:
         result = float(value)
@@ -192,7 +203,7 @@ def main() -> None:
     dataset_path = Path(args.dataset)
     if not dataset_path.exists():
         parser.error(f"dataset not found: {dataset_path}")
-    frame = pd.read_csv(dataset_path, encoding="utf-8-sig")
+    frame = _read_research_dataset(dataset_path)
     required = {"as_of_date", "symbol", args.target}
     missing = sorted(required.difference(frame.columns))
     if missing:

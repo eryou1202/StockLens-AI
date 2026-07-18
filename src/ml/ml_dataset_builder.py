@@ -26,6 +26,8 @@ class MLDatasetBuilder:
         settings: AppSettings,
         market_data_provider: MarketDataProvider | None = None,
         progress_callback: ProgressCallback | None = None,
+        use_cache: bool = True,
+        cache_dir: str = "data/ml/cache",
     ) -> None:
         self.settings = settings
         if market_data_provider is not None:
@@ -34,8 +36,8 @@ class MLDatasetBuilder:
         else:
             self.provider = create_market_data_provider(
                 settings.market_provider,
-                cache_dir="data/ml/cache",
-                use_cache=True,
+                cache_dir=cache_dir,
+                use_cache=use_cache,
             )
             # Index context must cover the full requested range. The legacy CSV cache
             # returns any overlapping slice, so a short smoke cache could otherwise
