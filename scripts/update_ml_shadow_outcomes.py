@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 
 
+HORIZONS = (1, 3, 5, 10)
+TOPK_BUCKETS = ("top10", "top20", "top50", "outside_top50")
 OUTCOME_COLUMNS = [
     "future_return_1d", "future_return_3d", "future_return_5d",
     "future_return_10d", "future_excess_return_5d", "future_rank_pct_5d",
@@ -41,25 +43,19 @@ def _mean(series: pd.Series) -> float | None:
     return None if pd.isna(value) else float(value)
 
 
-def _group_metrics(frame: pd.DataFrame, dimension: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    grouped = frame.groupby(dimension, dropna=False, sort=True)
-    for value, group in grouped:
-        completed = pd.to_numeric(group["future_return_5d"], errors="coerce").notna()
-        rows.append({
-            dimension: None if pd.isna(value) else str(value),
-            "total_signals": int(len(group)),
-            "completed_5d_count": int(completed.sum()),
-            "pending_count": int((~completed).sum()),
-            "avg_return_1d": _mean(group["future_return_1d"]),
-            "avg_return_3d": _mean(group["future_return_3d"]),
-            "avg_return_5d": _mean(group["future_return_5d"]),
-            "avg_return_10d": _mean(group["future_return_10d"]),
-            "avg_excess_return_5d": _mean(group["future_excess_return_5d"]),
-            "avg_rank_pct_5d": _mean(group["future_rank_pct_5d"]),
-            "hit_rate_5d": _mean(group["hit_5d"]),
-        })
-    return rows
+def _completed_mask(frame: pd.DataFrame, horizon: int) -> pd.Series:
+    column = f"future_return_{horizon}d"
+    if column not in frame.columns:
+        return pd.Series(False, index=frame.index)
+    return pd.to_numeric(frame[column], errors="coerce").notna()
+
+
+def _add_completion_counts(target: dict[str, Any], frame: pd.DataFrame) -> None:
+    total = len(frame)
+    for horizon in HORIZONS:
+        completed = int(_completed_mask(frame, horizon).sum())
+        target[f"completed_{horizon}d_count"] = completed
+        target[f"pending_{horizon}d_count"] = int(total - completed)
 
 
 def _bucket_frame(frame: pd.DataFrame, bucket: str) -> pd.DataFrame:
@@ -74,23 +70,94 @@ def _bucket_frame(frame: pd.DataFrame, bucket: str) -> pd.DataFrame:
     return frame.loc[frame["ml_bucket"].isin(values)]
 
 
+def _add_topk_multi_horizon_metrics(
+    target: dict[str, Any],
+    frame: pd.DataFrame,
+) -> None:
+    outside = _bucket_frame(frame, "outside_top50")
+    outside_returns = {
+        horizon: _mean(outside[f"future_return_{horizon}d"])
+        for horizon in HORIZONS
+    }
+    for bucket in TOPK_BUCKETS:
+        group = _bucket_frame(frame, bucket)
+        for horizon in HORIZONS:
+            avg_return = _mean(group[f"future_return_{horizon}d"])
+            target[f"{bucket}_avg_return_{horizon}d"] = avg_return
+            if bucket != "outside_top50":
+                outside_return = outside_returns[horizon]
+                target[f"{bucket}_excess_vs_outside_{horizon}d"] = (
+                    None if avg_return is None or outside_return is None
+                    else avg_return - outside_return
+                )
+
+
+def _group_metrics(frame: pd.DataFrame, dimension: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    grouped = frame.groupby(dimension, dropna=False, sort=True)
+    for value, group in grouped:
+        completed_5d = _completed_mask(group, 5)
+        row: dict[str, Any] = {
+            dimension: None if pd.isna(value) else str(value),
+            "total_signals": int(len(group)),
+            "completed_5d_count": int(completed_5d.sum()),
+            "pending_count": int((~completed_5d).sum()),
+            "avg_return_1d": _mean(group["future_return_1d"]),
+            "avg_return_3d": _mean(group["future_return_3d"]),
+            "avg_return_5d": _mean(group["future_return_5d"]),
+            "avg_return_10d": _mean(group["future_return_10d"]),
+            "avg_excess_return_5d": _mean(group["future_excess_return_5d"]),
+            "avg_rank_pct_5d": _mean(group["future_rank_pct_5d"]),
+            "hit_rate_5d": _mean(group["hit_5d"]),
+        }
+        _add_completion_counts(row, group)
+        rows.append(row)
+    return rows
+
+
+def _date_metrics(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    grouped = frame.groupby("as_of_date", dropna=False, sort=True)
+    for value, group in grouped:
+        completed_5d = _completed_mask(group, 5)
+        row: dict[str, Any] = {
+            "as_of_date": None if pd.isna(value) else str(value),
+            "total_signals": int(len(group)),
+            "completed_5d_count": int(completed_5d.sum()),
+            "pending_count": int((~completed_5d).sum()),
+            "avg_return_1d": _mean(group["future_return_1d"]),
+            "avg_return_3d": _mean(group["future_return_3d"]),
+            "avg_return_5d": _mean(group["future_return_5d"]),
+            "avg_return_10d": _mean(group["future_return_10d"]),
+            "avg_excess_return_5d": _mean(group["future_excess_return_5d"]),
+            "avg_rank_pct_5d": _mean(group["future_rank_pct_5d"]),
+            "hit_rate_5d": _mean(group["hit_5d"]),
+        }
+        _add_completion_counts(row, group)
+        _add_topk_multi_horizon_metrics(row, group)
+        rows.append(row)
+    return rows
+
+
 def _summary(frame: pd.DataFrame, history_file: str, dataset: str) -> dict[str, Any]:
-    completed = pd.to_numeric(frame["future_return_5d"], errors="coerce").notna()
+    completed_5d = _completed_mask(frame, 5)
     summary: dict[str, Any] = {
         "history_file": history_file,
         "dataset": dataset,
         "total_signals": int(len(frame)),
-        "completed_5d_count": int(completed.sum()),
-        "pending_count": int((~completed).sum()),
+        "completed_5d_count": int(completed_5d.sum()),
+        "pending_count": int((~completed_5d).sum()),
         "bucket_scope": {
             "top10": "ml_bucket == top10",
             "top20": "top10 + top20 cumulative",
             "top50": "top10 + top20 + top50 cumulative",
+            "outside_top50": "ml_bucket == outside_top50",
         },
     }
+    _add_completion_counts(summary, frame)
+    _add_topk_multi_horizon_metrics(summary, frame)
     for bucket in ("top10", "top20", "top50"):
         group = _bucket_frame(frame, bucket)
-        summary[f"{bucket}_avg_return_5d"] = _mean(group["future_return_5d"])
         summary[f"{bucket}_hit_rate_5d"] = _mean(group["hit_5d"])
     for level in ("extreme", "high", "medium", "low"):
         group = frame.loc[frame["shadow_risk_level"].eq(level)]
@@ -99,7 +166,7 @@ def _summary(frame: pd.DataFrame, history_file: str, dataset: str) -> dict[str, 
         "by_ml_bucket": _group_metrics(frame, "ml_bucket"),
         "by_shadow_risk_level": _group_metrics(frame, "shadow_risk_level"),
         "by_shadow_action": _group_metrics(frame, "shadow_action"),
-        "by_as_of_date": _group_metrics(frame, "as_of_date"),
+        "by_as_of_date": _date_metrics(frame),
     }
     summary["research_only_note"] = (
         "ML shadow outcomes are research statistics and do not affect formal recommendations."
@@ -183,8 +250,9 @@ def main() -> None:
 
     print("StockLens ML Shadow Outcome Tracker")
     print(f"total_signals: {summary['total_signals']}")
-    print(f"completed_5d_count: {summary['completed_5d_count']}")
-    print(f"pending_count: {summary['pending_count']}")
+    for horizon in HORIZONS:
+        print(f"completed_{horizon}d_count: {summary[f'completed_{horizon}d_count']}")
+        print(f"pending_{horizon}d_count: {summary[f'pending_{horizon}d_count']}")
     print(f"top10_avg_return_5d: {summary['top10_avg_return_5d']}")
     print(f"top20_avg_return_5d: {summary['top20_avg_return_5d']}")
     print(f"top50_avg_return_5d: {summary['top50_avg_return_5d']}")

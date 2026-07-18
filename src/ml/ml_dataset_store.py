@@ -9,9 +9,7 @@ from src.ml.ml_relative_labels import RelativeTargetLabelBuilder
 
 
 class MLDatasetStore:
-    def save(self, samples: list[MLResearchSample], output_path: str) -> pd.DataFrame:
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def to_frame(self, samples: list[MLResearchSample]) -> pd.DataFrame:
         columns = list(MLResearchSample.model_fields)
         columns.remove("metadata")
         include_context = any(
@@ -23,7 +21,12 @@ class MLDatasetStore:
             [sample.model_dump(mode="json", exclude={"metadata"}) for sample in samples],
             columns=columns,
         )
-        frame = RelativeTargetLabelBuilder.apply(frame)
+        return RelativeTargetLabelBuilder.apply(frame)
+
+    def save(self, samples: list[MLResearchSample], output_path: str) -> pd.DataFrame:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame = self.to_frame(samples)
         frame.to_csv(path, index=False, encoding="utf-8-sig")
         return frame
 

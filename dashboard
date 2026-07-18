@@ -1,0 +1,176 @@
+warning: in the working copy of 'scripts/update_ml_shadow_outcomes.py', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/scripts/update_ml_shadow_outcomes.py b/scripts/update_ml_shadow_outcomes.py[m
+[1mindex f06de13..2b934bd 100644[m
+[1m--- a/scripts/update_ml_shadow_outcomes.py[m
+[1m+++ b/scripts/update_ml_shadow_outcomes.py[m
+[36m@@ -9,6 +9,8 @@[m [mimport numpy as np[m
+ import pandas as pd[m
+ [m
+ [m
+[32m+[m[32mHORIZONS = (1, 3, 5, 10)[m
+[32m+[m[32mTOPK_BUCKETS = ("top10", "top20", "top50", "outside_top50")[m
+ OUTCOME_COLUMNS = [[m
+     "future_return_1d", "future_return_3d", "future_return_5d",[m
+     "future_return_10d", "future_excess_return_5d", "future_rank_pct_5d",[m
+[36m@@ -41,16 +43,65 @@[m [mdef _mean(series: pd.Series) -> float | None:[m
+     return None if pd.isna(value) else float(value)[m
+ [m
+ [m
+[32m+[m[32mdef _completed_mask(frame: pd.DataFrame, horizon: int) -> pd.Series:[m
+[32m+[m[32m    column = f"future_return_{horizon}d"[m
+[32m+[m[32m    if column not in frame.columns:[m
+[32m+[m[32m        return pd.Series(False, index=frame.index)[m
+[32m+[m[32m    return pd.to_numeric(frame[column], errors="coerce").notna()[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _add_completion_counts(target: dict[str, Any], frame: pd.DataFrame) -> None:[m
+[32m+[m[32m    total = len(frame)[m
+[32m+[m[32m    for horizon in HORIZONS:[m
+[32m+[m[32m        completed = int(_completed_mask(frame, horizon).sum())[m
+[32m+[m[32m        target[f"completed_{horizon}d_count"] = completed[m
+[32m+[m[32m        target[f"pending_{horizon}d_count"] = int(total - completed)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _bucket_frame(frame: pd.DataFrame, bucket: str) -> pd.DataFrame:[m
+[32m+[m[32m    if bucket == "top10":[m
+[32m+[m[32m        values = {"top10"}[m
+[32m+[m[32m    elif bucket == "top20":[m
+[32m+[m[32m        values = {"top10", "top20"}[m
+[32m+[m[32m    elif bucket == "top50":[m
+[32m+[m[32m        values = {"top10", "top20", "top50"}[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        values = {bucket}[m
+[32m+[m[32m    return frame.loc[frame["ml_bucket"].isin(values)][m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _add_topk_multi_horizon_metrics([m
+[32m+[m[32m    target: dict[str, Any],[m
+[32m+[m[32m    frame: pd.DataFrame,[m
+[32m+[m[32m) -> None:[m
+[32m+[m[32m    outside = _bucket_frame(frame, "outside_top50")[m
+[32m+[m[32m    outside_returns = {[m
+[32m+[m[32m        horizon: _mean(outside[f"future_return_{horizon}d"])[m
+[32m+[m[32m        for horizon in HORIZONS[m
+[32m+[m[32m    }[m
+[32m+[m[32m    for bucket in TOPK_BUCKETS:[m
+[32m+[m[32m        group = _bucket_frame(frame, bucket)[m
+[32m+[m[32m        for horizon in HORIZONS:[m
+[32m+[m[32m            avg_return = _mean(group[f"future_return_{horizon}d"])[m
+[32m+[m[32m            target[f"{bucket}_avg_return_{horizon}d"] = avg_return[m
+[32m+[m[32m            if bucket != "outside_top50":[m
+[32m+[m[32m                outside_return = outside_returns[horizon][m
+[32m+[m[32m                target[f"{bucket}_excess_vs_outside_{horizon}d"] = ([m
+[32m+[m[32m                    None if avg_return is None or outside_return is None[m
+[32m+[m[32m                    else avg_return - outside_return[m
+[32m+[m[32m                )[m
+[32m+[m
+[32m+[m
+ def _group_metrics(frame: pd.DataFrame, dimension: str) -> list[dict[str, Any]]:[m
+     rows: list[dict[str, Any]] = [][m
+     grouped = frame.groupby(dimension, dropna=False, sort=True)[m
+     for value, group in grouped:[m
+[31m-        completed = pd.to_numeric(group["future_return_5d"], errors="coerce").notna()[m
+[31m-        rows.append({[m
+[32m+[m[32m        completed_5d = _completed_mask(group, 5)[m
+[32m+[m[32m        row: dict[str, Any] = {[m
+             dimension: None if pd.isna(value) else str(value),[m
+             "total_signals": int(len(group)),[m
+[31m-            "completed_5d_count": int(completed.sum()),[m
+[31m-            "pending_count": int((~completed).sum()),[m
+[32m+[m[32m            "completed_5d_count": int(completed_5d.sum()),[m
+[32m+[m[32m            "pending_count": int((~completed_5d).sum()),[m
+             "avg_return_1d": _mean(group["future_return_1d"]),[m
+             "avg_return_3d": _mean(group["future_return_3d"]),[m
+             "avg_return_5d": _mean(group["future_return_5d"]),[m
+[36m@@ -58,39 +109,55 @@[m [mdef _group_metrics(frame: pd.DataFrame, dimension: str) -> list[dict[str, Any]]:[m
+             "avg_excess_return_5d": _mean(group["future_excess_return_5d"]),[m
+             "avg_rank_pct_5d": _mean(group["future_rank_pct_5d"]),[m
+             "hit_rate_5d": _mean(group["hit_5d"]),[m
+[31m-        })[m
+[32m+[m[32m        }[m
+[32m+[m[32m        _add_completion_counts(row, group)[m
+[32m+[m[32m        rows.append(row)[m
+     return rows[m
+ [m
+ [m
+[31m-def _bucket_frame(frame: pd.DataFrame, bucket: str) -> pd.DataFrame:[m
+[31m-    if bucket == "top10":[m
+[31m-        values = {"top10"}[m
+[31m-    elif bucket == "top20":[m
+[31m-        values = {"top10", "top20"}[m
+[31m-    elif bucket == "top50":[m
+[31m-        values = {"top10", "top20", "top50"}[m
+[31m-    else:[m
+[31m-        values = {bucket}[m
+[31m-    return frame.loc[frame["ml_bucket"].isin(values)][m
+[32m+[m[32mdef _date_metrics(frame: pd.DataFrame) -> list[dict[str, Any]]:[m
+[32m+[m[32m    rows: list[dict[str, Any]] = [][m
+[32m+[m[32m    grouped = frame.groupby("as_of_date", dropna=False, sort=True)[m
+[32m+[m[32m    for value, group in grouped:[m
+[32m+[m[32m        completed_5d = _completed_mask(group, 5)[m
+[32m+[m[32m        row: dict[str, Any] = {[m
+[32m+[m[32m            "as_of_date": None if pd.isna(value) else str(value),[m
+[32m+[m[32m            "total_signals": int(len(group)),[m
+[32m+[m[32m            "completed_5d_count": int(completed_5d.sum()),[m
+[32m+[m[32m            "pending_count": int((~completed_5d).sum()),[m
+[32m+[m[32m            "avg_return_1d": _mean(group["future_return_1d"]),[m
+[32m+[m[32m            "avg_return_3d": _mean(group["future_return_3d"]),[m
+[32m+[m[32m            "avg_return_5d": _mean(group["future_return_5d"]),[m
+[32m+[m[32m            "avg_return_10d": _mean(group["future_return_10d"]),[m
+[32m+[m[32m            "avg_excess_return_5d": _mean(group["future_excess_return_5d"]),[m
+[32m+[m[32m            "avg_rank_pct_5d": _mean(group["future_rank_pct_5d"]),[m
+[32m+[m[32m            "hit_rate_5d": _mean(group["hit_5d"]),[m
+[32m+[m[32m        }[m
+[32m+[m[32m        _add_completion_counts(row, group)[m
+[32m+[m[32m        _add_topk_multi_horizon_metrics(row, group)[m
+[32m+[m[32m        rows.append(row)[m
+[32m+[m[32m    return rows[m
+ [m
+ [m
+ def _summary(frame: pd.DataFrame, history_file: str, dataset: str) -> dict[str, Any]:[m
+[31m-    completed = pd.to_numeric(frame["future_return_5d"], errors="coerce").notna()[m
+[32m+[m[32m    completed_5d = _completed_mask(frame, 5)[m
+     summary: dict[str, Any] = {[m
+         "history_file": history_file,[m
+         "dataset": dataset,[m
+         "total_signals": int(len(frame)),[m
+[31m-        "completed_5d_count": int(completed.sum()),[m
+[31m-        "pending_count": int((~completed).sum()),[m
+[32m+[m[32m        "completed_5d_count": int(completed_5d.sum()),[m
+[32m+[m[32m        "pending_count": int((~completed_5d).sum()),[m
+         "bucket_scope": {[m
+             "top10": "ml_bucket == top10",[m
+             "top20": "top10 + top20 cumulative",[m
+             "top50": "top10 + top20 + top50 cumulative",[m
+[32m+[m[32m            "outside_top50": "ml_bucket == outside_top50",[m
+         },[m
+     }[m
+[32m+[m[32m    _add_completion_counts(summary, frame)[m
+[32m+[m[32m    _add_topk_multi_horizon_metrics(summary, frame)[m
+     for bucket in ("top10", "top20", "top50"):[m
+         group = _bucket_frame(frame, bucket)[m
+[31m-        summary[f"{bucket}_avg_return_5d"] = _mean(group["future_return_5d"])[m
+         summary[f"{bucket}_hit_rate_5d"] = _mean(group["hit_5d"])[m
+     for level in ("extreme", "high", "medium", "low"):[m
+         group = frame.loc[frame["shadow_risk_level"].eq(level)][m
+[36m@@ -99,7 +166,7 @@[m [mdef _summary(frame: pd.DataFrame, history_file: str, dataset: str) -> dict[str,[m
+         "by_ml_bucket": _group_metrics(frame, "ml_bucket"),[m
+         "by_shadow_risk_level": _group_metrics(frame, "shadow_risk_level"),[m
+         "by_shadow_action": _group_metrics(frame, "shadow_action"),[m
+[31m-        "by_as_of_date": _group_metrics(frame, "as_of_date"),[m
+[32m+[m[32m        "by_as_of_date": _date_metrics(frame),[m
+     }[m
+     summary["research_only_note"] = ([m
+         "ML shadow outcomes are research statistics and do not affect formal recommendations."[m
+[36m@@ -183,8 +250,9 @@[m [mdef main() -> None:[m
+ [m
+     print("StockLens ML Shadow Outcome Tracker")[m
+     print(f"total_signals: {summary['total_signals']}")[m
+[31m-    print(f"completed_5d_count: {summary['completed_5d_count']}")[m
+[31m-    print(f"pending_count: {summary['pending_count']}")[m
+[32m+[m[32m    for horizon in HORIZONS:[m
+[32m+[m[32m        print(f"completed_{horizon}d_count: {summary[f'completed_{horizon}d_count']}")[m
+[32m+[m[32m        print(f"pending_{horizon}d_count: {summary[f'pending_{horizon}d_count']}")[m
+     print(f"top10_avg_return_5d: {summary['top10_avg_return_5d']}")[m
+     print(f"top20_avg_return_5d: {summary['top20_avg_return_5d']}")[m
+     print(f"top50_avg_return_5d: {summary['top50_avg_return_5d']}")[m

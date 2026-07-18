@@ -53,6 +53,10 @@ ML_SHADOW_OUTCOME_SUMMARY_FILE = (
 ML_SHADOW_OUTCOMES_FILE = (
     PROJECT_ROOT / "data" / "ml" / "shadow_mode" / "ml_shadow_outcomes.csv"
 )
+TRACKING_REPORT_DIR = PROJECT_ROOT / "data" / "tracking"
+TRACKING_REPORT_SUMMARY_FILE = TRACKING_REPORT_DIR / "recommendation_tracking_summary.json"
+TRACKING_REPORT_METRICS_FILE = TRACKING_REPORT_DIR / "recommendation_tracking_metrics.csv"
+TRACKING_REPORT_CASES_FILE = TRACKING_REPORT_DIR / "recommendation_tracking_cases.csv"
 NAME_RESOLVER = SymbolNameResolver(SETTINGS.database_path, str(AI_FILE))
 POOL = CandidatePoolEditor(AI_FILE, NAME_RESOLVER)
 
@@ -187,6 +191,7 @@ OUTCOME_PERCENT_COLUMNS = {
     "future_excess_return_5d",
     "future_rank_pct_5d",
 }
+OUTCOME_HORIZONS = (1, 3, 5, 10)
 
 
 def _is_missing(value) -> bool:
@@ -224,11 +229,83 @@ def _outcome_aggregation_frame(records: list[dict]) -> pd.DataFrame:
         return frame
     display = frame.copy()
     for column in display.columns:
-        if column in OUTCOME_PERCENT_COLUMNS:
+        if column in OUTCOME_PERCENT_COLUMNS or _is_outcome_percent_column(column):
             display[column] = display[column].apply(_fmt_percent)
         elif column.endswith("_count") or column in {"total_signals", "pending_count"}:
             display[column] = display[column].apply(_fmt_count)
     return display
+
+
+def _is_outcome_percent_column(column: str) -> bool:
+    return (
+        column.startswith(("top10_avg_return_", "top20_avg_return_", "top50_avg_return_", "outside_top50_avg_return_"))
+        or column.startswith(("top10_excess_vs_outside_", "top20_excess_vs_outside_", "top50_excess_vs_outside_"))
+        or column.endswith("_hit_rate")
+        or "hit_rate" in column
+        or "avg_rank_pct" in column
+    )
+
+
+def _ready_label(summary: dict, horizon: int) -> str:
+    completed = _outcome_summary_metric(summary, f"completed_{horizon}d_count")
+    pending = _outcome_summary_metric(summary, f"pending_{horizon}d_count")
+    return f"{completed} / pending {pending}"
+
+
+def _topk_return_table(summary: dict) -> pd.DataFrame:
+    labels = {
+        "top10": "Top10",
+        "top20": "累计 Top20",
+        "top50": "累计 Top50",
+        "outside_top50": "Outside Top50",
+    }
+    rows = []
+    for bucket, label in labels.items():
+        row = {"scope": label}
+        for horizon in OUTCOME_HORIZONS:
+            row[f"{horizon}D"] = _fmt_percent(summary.get(f"{bucket}_avg_return_{horizon}d"))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _topk_excess_table(summary: dict) -> pd.DataFrame:
+    labels = {
+        "top10": "Top10",
+        "top20": "累计 Top20",
+        "top50": "累计 Top50",
+    }
+    rows = []
+    for bucket, label in labels.items():
+        row = {"scope": label}
+        for horizon in OUTCOME_HORIZONS:
+            row[f"{horizon}D excess"] = _fmt_percent(
+                summary.get(f"{bucket}_excess_vs_outside_{horizon}d")
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _as_of_date_batch_frame(records: list[dict]) -> pd.DataFrame:
+    frame = pd.DataFrame(records or [])
+    if frame.empty:
+        return frame
+    rows = []
+    for item in frame.to_dict("records"):
+        row = {
+            "as_of_date": item.get("as_of_date"),
+            "total": _fmt_count(item.get("total_signals")),
+        }
+        for horizon in OUTCOME_HORIZONS:
+            completed = _fmt_count(item.get(f"completed_{horizon}d_count"))
+            pending = _fmt_count(item.get(f"pending_{horizon}d_count"))
+            row[f"ready_{horizon}d"] = f"{completed} / pending {pending}"
+        for bucket, label in (("top10", "Top10"), ("top20", "Top20"), ("top50", "Top50")):
+            for horizon in OUTCOME_HORIZONS:
+                row[f"{label}_{horizon}D"] = _fmt_percent(
+                    item.get(f"{bucket}_avg_return_{horizon}d")
+                )
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _shadow_outcome_detail_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -293,6 +370,10 @@ def _show_ml_shadow_outcome_section() -> None:
             st.warning("仍有 pending 信号，等待未来标签回填。")
         if completed_5d_count < 1000:
             st.warning("完成样本仍少，结论不稳定。")
+        st.info(
+            "部分周期完成不代表 5D 主目标完成；模型主目标仍是 future_top30_5d。"
+            "全部结果均为 research-only，不参与正式推荐。"
+        )
 
         count_metrics = st.columns(3)
         count_metrics[0].metric("total_signals", _outcome_summary_metric(summary, "total_signals"))
@@ -301,6 +382,25 @@ def _show_ml_shadow_outcome_section() -> None:
             _outcome_summary_metric(summary, "completed_5d_count"),
         )
         count_metrics[2].metric("pending_count", _outcome_summary_metric(summary, "pending_count"))
+
+        st.markdown("#### 多周期完成进度")
+        progress_metrics = st.columns(4)
+        for metric, horizon in zip(progress_metrics, OUTCOME_HORIZONS):
+            metric.metric(f"{horizon}D completed / pending", _ready_label(summary, horizon))
+
+        st.markdown("#### TopK 多周期平均收益")
+        st.dataframe(
+            _topk_return_table(summary),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### TopK 相对 Outside Top50 超额收益")
+        st.dataframe(
+            _topk_excess_table(summary),
+            use_container_width=True,
+            hide_index=True,
+        )
 
         bucket_metrics = st.columns(3)
         bucket_metrics[0].metric(
@@ -341,6 +441,13 @@ def _show_ml_shadow_outcome_section() -> None:
             metric.metric(key, _outcome_summary_metric(summary, key, percent=True))
 
         aggregations = summary.get("aggregations") or {}
+        st.markdown("#### 按 as_of_date 的批次阶段表现")
+        batch_frame = _as_of_date_batch_frame(aggregations.get("by_as_of_date", []))
+        if batch_frame.empty:
+            st.info("暂无批次阶段表现数据。")
+        else:
+            st.dataframe(batch_frame, use_container_width=True, hide_index=True)
+
         for title, key in (
             ("按 ml_bucket 聚合", "by_ml_bucket"),
             ("按 shadow_risk_level 聚合", "by_shadow_risk_level"),
@@ -373,14 +480,20 @@ def _show_ml_shadow_outcome_section() -> None:
         detail_filters = st.columns(4)
         as_of_options = sorted(outcome_frame["as_of_date"].dropna().astype(str).unique())
         selected_as_of_dates = detail_filters[0].multiselect(
-            "as_of_date", as_of_options, default=as_of_options
+            "as_of_date",
+            as_of_options,
+            default=as_of_options,
+            key="ml_shadow_outcome_as_of_filter",
         )
         bucket_options = [
             bucket for bucket in ("top10", "top20", "top50", "outside_top50")
             if bucket in set(outcome_frame["ml_bucket"].dropna())
         ]
         selected_buckets = detail_filters[1].multiselect(
-            "ml_bucket", bucket_options, default=bucket_options
+            "ml_bucket",
+            bucket_options,
+            default=bucket_options,
+            key="ml_shadow_outcome_bucket_filter",
         )
         risk_options = [
             level for level in ("low", "medium", "high", "extreme")
@@ -391,10 +504,14 @@ def _show_ml_shadow_outcome_section() -> None:
             risk_options,
             default=risk_options,
             format_func=lambda value: SHADOW_RISK_LABELS.get(value, value),
+            key="ml_shadow_outcome_risk_filter",
         )
         status_options = sorted(outcome_frame["outcome_status"].dropna().astype(str).unique())
         selected_statuses = detail_filters[3].multiselect(
-            "outcome_status", status_options, default=status_options
+            "outcome_status",
+            status_options,
+            default=status_options,
+            key="ml_shadow_outcome_status_filter",
         )
 
         filtered = outcome_frame.loc[
@@ -432,6 +549,220 @@ def _tracking_rows(items) -> list[dict]:
         "tracking_status": item.tracking_status.value,
         "manual_verdict": item.manual_verdict.value if item.manual_verdict else "-",
     } for item in items]
+
+
+def _tracking_report_overall_frame(summary: dict) -> pd.DataFrame:
+    progress = summary.get("completion_progress", {})
+    overall = summary.get("overall_metrics", {})
+    rows = []
+    for horizon in (1, 3, 5, 10):
+        metrics = overall.get(f"{horizon}d", {})
+        rows.append({
+            "周期": f"{horizon}D",
+            "已完成": _fmt_count(progress.get(f"completed_{horizon}d_count")),
+            "待回填": _fmt_count(progress.get(f"pending_{horizon}d_count")),
+            "平均收益": _fmt_percent(metrics.get("avg_return")),
+            "中位收益": _fmt_percent(metrics.get("median_return")),
+            "上涨比例": _fmt_percent(metrics.get("positive_return_rate")),
+            "最佳收益": _fmt_percent(metrics.get("best_return")),
+            "最差收益": _fmt_percent(metrics.get("worst_return")),
+        })
+    drawdown = overall.get("drawdown_5d", {})
+    rows.append({
+        "周期": "5D 回撤",
+        "已完成": _fmt_count(drawdown.get("sample_count")),
+        "待回填": "-",
+        "平均收益": _fmt_percent(drawdown.get("avg_max_drawdown_5d")),
+        "中位收益": _fmt_percent(drawdown.get("median_max_drawdown_5d")),
+        "上涨比例": "-",
+        "最佳收益": _fmt_percent(drawdown.get("drawdown_below_minus_5pct_rate")),
+        "最差收益": _fmt_percent(drawdown.get("drawdown_below_minus_10pct_rate")),
+    })
+    return pd.DataFrame(rows)
+
+
+def _tracking_report_group_frame(records: list[dict]) -> pd.DataFrame:
+    frame = pd.DataFrame(records or [])
+    if frame.empty:
+        return frame
+    preferred_columns = [
+        "group", "total_records",
+        "completed_1d_count", "avg_return_1d", "positive_rate_1d",
+        "completed_3d_count", "avg_return_3d", "positive_rate_3d",
+        "completed_5d_count", "avg_return_5d", "positive_rate_5d",
+        "completed_10d_count", "avg_return_10d", "positive_rate_10d",
+        "avg_max_drawdown_5d", "score_min", "score_max", "avg_score",
+        "sample_note",
+    ]
+    columns = [column for column in preferred_columns if column in frame.columns]
+    display = frame.reindex(columns=columns).copy()
+    for column in display.columns:
+        if column.startswith(("avg_return_", "positive_rate_")) or column == "avg_max_drawdown_5d":
+            display[column] = display[column].apply(_fmt_percent)
+        elif column.endswith("_count") or column == "total_records":
+            display[column] = display[column].apply(_fmt_count)
+        elif column in {"score_min", "score_max", "avg_score"}:
+            display[column] = pd.to_numeric(display[column], errors="coerce").round(2)
+    return display
+
+
+def _tracking_report_cases_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "case_type", "id", "as_of_time", "symbol", "stock_name", "source_type",
+        "action", "action_level", "quant_decision", "confidence", "final_score",
+        "current_price", "future_return_1d", "future_return_3d", "future_return_5d",
+        "future_return_10d", "future_max_drawdown_5d", "tracking_status",
+        "manual_verdict", "reason_summary", "risk_summary",
+    ]
+    display = frame.reindex(columns=[column for column in columns if column in frame.columns]).copy()
+    if "stock_name" in display.columns:
+        display["stock_name"] = display["stock_name"].fillna("未知名称").replace("", "未知名称")
+    for column in (
+        "future_return_1d", "future_return_3d", "future_return_5d",
+        "future_return_10d", "future_max_drawdown_5d",
+    ):
+        if column in display.columns:
+            display[column] = display[column].apply(_fmt_percent)
+    if "confidence" in display.columns:
+        display["confidence"] = display["confidence"].apply(_fmt_percent)
+    for column in ("final_score", "current_price"):
+        if column in display.columns:
+            display[column] = pd.to_numeric(display[column], errors="coerce").round(2)
+    return display
+
+
+def _show_tracking_report_section() -> None:
+    st.markdown("#### 正式推荐表现总览")
+    with st.expander("正式推荐表现总览（只读报表）", expanded=True):
+        st.warning("正式推荐追踪结果仅用于历史复盘和算法评估，不构成投资建议。")
+        st.caption(
+            "口径说明：这里读取正式 recommendation_tracking 历史；算法审查、ML Shadow 与正式追踪是相互隔离的数据系统。"
+        )
+        required_files = [
+            TRACKING_REPORT_SUMMARY_FILE,
+            TRACKING_REPORT_METRICS_FILE,
+            TRACKING_REPORT_CASES_FILE,
+        ]
+        missing_files = [path for path in required_files if not path.exists()]
+        if missing_files:
+            st.info("尚未生成正式推荐追踪报告，请先运行 scripts.build_recommendation_tracking_report。")
+            st.caption("缺失文件：" + "；".join(str(path) for path in missing_files))
+            return
+
+        try:
+            summary = json.loads(TRACKING_REPORT_SUMMARY_FILE.read_text(encoding="utf-8"))
+            metrics_frame = pd.read_csv(TRACKING_REPORT_METRICS_FILE, encoding="utf-8-sig")
+            cases_frame = pd.read_csv(TRACKING_REPORT_CASES_FILE, encoding="utf-8-sig")
+        except Exception as exc:
+            st.error(f"读取正式推荐追踪报表失败：{type(exc).__name__}: {exc}")
+            return
+
+        if not summary.get("database_unchanged", True):
+            st.error("报表生成前后数据库状态不一致，请谨慎解读并重新检查。")
+        if summary.get("missing_columns"):
+            st.warning(f"recommendation_tracking 缺少字段：{summary.get('missing_columns')}")
+
+        progress = summary.get("completion_progress", {})
+        date_range = summary.get("date_range", {})
+        st.caption(
+            f"数据日期：{date_range.get('min') or '-'} 至 {date_range.get('max') or '-'}；"
+            f"metrics rows: {len(metrics_frame):,}；cases rows: {len(cases_frame):,}"
+        )
+
+        metric_columns = st.columns(5)
+        metric_columns[0].metric("追踪记录", _fmt_count(summary.get("total_records")))
+        metric_columns[1].metric("1D 已完成", _fmt_count(progress.get("completed_1d_count")))
+        metric_columns[2].metric("3D 已完成", _fmt_count(progress.get("completed_3d_count")))
+        metric_columns[3].metric("5D 已完成", _fmt_count(progress.get("completed_5d_count")))
+        metric_columns[4].metric("10D 已完成", _fmt_count(progress.get("completed_10d_count")))
+        if int(progress.get("completed_5d_count") or 0) < 30:
+            st.info("5D 完成样本仍少，当前统计只能用于检查流程和早期观察，不能证明策略有效。")
+
+        st.markdown("##### 多周期完成进度与整体表现")
+        st.dataframe(
+            _tracking_report_overall_frame(summary),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        group_sections = [
+            ("按 action", summary.get("by_action", [])),
+            ("按 quant_decision", summary.get("by_quant_decision", [])),
+            ("按 source_type", summary.get("by_source_type", [])),
+            ("按 confidence 分桶", summary.get("by_confidence_bucket", [])),
+            ("按 final_score 分桶", summary.get("by_final_score_bucket", [])),
+            ("action × quant_decision", summary.get("by_action_quant_decision", [])),
+            ("按 as_of_date 批次", summary.get("by_as_of_date", [])),
+        ]
+        for title, records in group_sections:
+            st.markdown(f"##### {title}")
+            group_frame = _tracking_report_group_frame(records)
+            if group_frame.empty:
+                st.info(f"暂无 {title} 数据。")
+            else:
+                st.dataframe(group_frame, use_container_width=True, hide_index=True)
+
+        hints = summary.get("diagnostic_hints") or []
+        if hints:
+            st.caption("诊断提示：" + "；".join(str(item) for item in hints))
+
+        st.markdown("##### 典型案例")
+        if cases_frame.empty:
+            st.info("暂无可展示案例；通常是因为未来收益尚未完成回填。")
+            return
+        case_filters = st.columns(5)
+        selected_case_types = case_filters[0].multiselect(
+            "case_type",
+            sorted(cases_frame["case_type"].dropna().astype(str).unique()),
+            key="tracking_report_case_type_filter",
+        )
+        selected_actions = case_filters[1].multiselect(
+            "action",
+            sorted(cases_frame["action"].dropna().astype(str).unique()),
+            key="tracking_report_action_filter",
+        )
+        selected_quant = case_filters[2].multiselect(
+            "quant_decision",
+            sorted(cases_frame["quant_decision"].dropna().astype(str).unique()),
+            key="tracking_report_quant_filter",
+        )
+        selected_source = case_filters[3].multiselect(
+            "source_type",
+            sorted(cases_frame["source_type"].dropna().astype(str).unique()),
+            key="tracking_report_source_filter",
+        )
+        symbol_query = case_filters[4].text_input("symbol 搜索", key="tracking_case_symbol")
+        filtered_cases = cases_frame.copy()
+        if selected_case_types:
+            filtered_cases = filtered_cases[
+                filtered_cases["case_type"].astype(str).isin(selected_case_types)
+            ]
+        if selected_actions:
+            filtered_cases = filtered_cases[
+                filtered_cases["action"].astype(str).isin(selected_actions)
+            ]
+        if selected_quant:
+            filtered_cases = filtered_cases[
+                filtered_cases["quant_decision"].astype(str).isin(selected_quant)
+            ]
+        if selected_source:
+            filtered_cases = filtered_cases[
+                filtered_cases["source_type"].astype(str).isin(selected_source)
+            ]
+        if symbol_query:
+            filtered_cases = filtered_cases[
+                filtered_cases["symbol"].fillna("").astype(str).str.upper().str.contains(
+                    symbol_query.upper(), regex=False
+                )
+            ]
+        if filtered_cases.empty:
+            st.info("当前筛选条件下没有案例。")
+        else:
+            st.dataframe(
+                _tracking_report_cases_frame(filtered_cases),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 def _audit_group_frame(groups: dict, group_name: str) -> pd.DataFrame:
@@ -826,19 +1157,28 @@ with tab_ml_shadow:
                     risk_options,
                     default=risk_options,
                     format_func=lambda value: SHADOW_RISK_LABELS.get(value, value),
+                    key="ml_shadow_latest_risk_filter",
                 )
                 bucket_options = [
                     bucket for bucket in ("top10", "top20", "top50", "outside_top50")
                     if bucket in set(shadow_frame["ml_bucket"].dropna())
                 ]
                 selected_buckets = filter_columns[1].multiselect(
-                    "ml_bucket", bucket_options, default=bucket_options
+                    "ml_bucket",
+                    bucket_options,
+                    default=bucket_options,
+                    key="ml_shadow_latest_bucket_filter",
                 )
                 minimum_score = filter_columns[2].slider(
                     "最低 ml_score", min_value=0.0, max_value=1.0,
                     value=0.0, step=0.01,
+                    key="ml_shadow_latest_min_score_filter",
                 )
-                hide_extreme = filter_columns[3].checkbox("隐藏 extreme", value=False)
+                hide_extreme = filter_columns[3].checkbox(
+                    "隐藏 extreme",
+                    value=False,
+                    key="ml_shadow_latest_hide_extreme_filter",
+                )
 
                 filtered_shadow = shadow_frame.loc[
                     shadow_frame["shadow_risk_level"].isin(selected_risks)
@@ -1026,6 +1366,8 @@ with tab_sell:
 
 with tab_tracking:
     st.subheader("推荐追踪复盘")
+    _show_tracking_report_section()
+    st.markdown("---")
     tracker = RecommendationTracker(SETTINGS.database_path)
     filters = st.columns(3)
     status_filter = filters[0].selectbox("tracking_status", ["all", "tracking", "complete", "failed"])
