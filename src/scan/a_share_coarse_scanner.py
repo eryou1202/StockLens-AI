@@ -268,17 +268,8 @@ class AShareCoarseScanner:
         start_time: datetime,
         end_time: datetime,
     ) -> Iterator[tuple[dict[str, Any], MarketDataBundle | None, str | None]]:
-        import baostock as bs
-        from src.data.symbol_mapper import SymbolMapper
-
-        login = bs.login()
-        if login.error_code != "0":
-            error = f"baostock_login:{login.error_msg}"
-            for item in universe:
-                yield item, None, error
-            return
         provider = self.provider
-        try:
+        with provider.session():
             for item in universe:
                 symbol = item["symbol"]
                 try:
@@ -292,44 +283,26 @@ class AShareCoarseScanner:
                         yield item, cached, None
                         continue
 
-                    query = bs.query_history_k_data_plus(
-                        SymbolMapper.to_baostock(symbol),
-                        provider.DEFAULT_FIELDS,
-                        start_date=start_time.strftime("%Y-%m-%d"),
-                        end_date=end_time.strftime("%Y-%m-%d"),
-                        frequency=provider.FREQ_MAP[self.settings.market_frequency],
-                        adjustflag=provider.ADJUST_MAP[self.settings.market_adjust_type],
-                    )
-                    if query.error_code != "0":
-                        raise RuntimeError(query.error_msg)
-                    raw_rows = []
-                    while query.next():
-                        raw_rows.append(query.get_row_data())
-                    frame = pd.DataFrame(raw_rows, columns=query.fields)
-                    bars = provider._frame_to_bars(
-                        frame,
+                    bundle = provider.query_history_bars(
                         symbol,
+                        start_time,
+                        end_time,
                         self.settings.market_frequency,
                         self.settings.market_adjust_type,
-                        SymbolMapper.to_baostock(symbol),
                     )
-                    bundle = MarketDataBundle(
-                        symbol=symbol,
-                        start_time=start_time,
-                        end_time=end_time,
-                        frequency=self.settings.market_frequency,
-                        adjust_type=self.settings.market_adjust_type,
-                        provider=provider.provider_name,
-                        bars=bars,
-                        data_quality={"from_cache": False, "rows": len(bars), "coarse_scan": True},
+                    bundle = bundle.model_copy(
+                        update={
+                            "data_quality": {
+                                **bundle.data_quality,
+                                "coarse_scan": True,
+                            }
+                        }
                     )
-                    if provider.cache is not None and bars:
+                    if provider.cache is not None and bundle.bars:
                         provider.cache.save_bundle(bundle)
                     yield item, bundle, None
                 except Exception as exc:
                     yield item, None, f"{type(exc).__name__}:{exc}"
-        finally:
-            bs.logout()
 
     def _analyze(
         self,

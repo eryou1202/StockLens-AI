@@ -34,6 +34,21 @@ def build_open_position_sell_signals(
     now = as_of_time or datetime.now()
     candidates = FileAIInfoEngine("data/ai_candidates.json").generate_candidates(now)
     candidate_map = {item.stock_code: item for item in candidates}
+    missing_name_symbols = [
+        position.symbol for position in positions
+        if _missing_position_name(position.stock_name)
+    ]
+    resolved_names = name_resolver.resolve_many(missing_name_symbols)
+    if resolved_names:
+        updated_positions = []
+        for position in positions:
+            resolved_name = resolved_names.get(position.symbol)
+            if _missing_position_name(position.stock_name) and resolved_name:
+                if position.id:
+                    manager.update_stock_name(position.id, resolved_name)
+                position = position.model_copy(update={"stock_name": resolved_name})
+            updated_positions.append(position)
+        positions = updated_positions
     # force_refresh wins over use_cache. Providers without a dedicated refresh API
     # are refreshed by constructing them with cache reads/writes disabled.
     provider = create_market_data_provider(
@@ -44,12 +59,15 @@ def build_open_position_sell_signals(
     quote_provider = RealtimeQuoteProvider(cache_seconds=30)
     quotes = quote_provider.get_all_quotes(force_refresh=force_refresh)
     quant_engine, decision_engine, sell_engine = RuleBasedQuantEngine(), DecisionEngine(), SellSignalEngine()
+    market_data_by_symbol = {}
+    with provider.session():
+        for symbol in dict.fromkeys(position.symbol for position in positions):
+            market_data_by_symbol[symbol] = provider.get_bars(
+                symbol, now - timedelta(days=settings.default_lookback_days), now,
+                settings.market_frequency, settings.market_adjust_type,
+            )
     results: list[Recommendation] = []
     for position in positions:
-        if not position.stock_name or position.stock_name.strip() in {"", "-", "未知名称"}:
-            resolved_name = name_resolver.update_position_name_if_missing(position.symbol)
-            if resolved_name:
-                position = position.model_copy(update={"stock_name": resolved_name})
         candidate = candidate_map.get(position.symbol)
         if candidate and not position.stock_name and candidate.stock_name and position.id:
             manager.update_stock_name(position.id, candidate.stock_name)
@@ -62,10 +80,7 @@ def build_open_position_sell_signals(
             risk_flags=["该标的不在当前 AI 候选池中。"],
             metadata={"source_type": position.metadata.get("source_type", "position")},
         )
-        market_data = provider.get_bars(
-            position.symbol, now - timedelta(days=settings.default_lookback_days), now,
-            settings.market_frequency, settings.market_adjust_type,
-        )
+        market_data = market_data_by_symbol[position.symbol]
         latest_bar = _latest_market_bar(market_data)
         price = quote_provider.get_current_price(
             position.symbol,
@@ -94,6 +109,10 @@ def build_open_position_sell_signals(
             )
         )
     return results
+
+
+def _missing_position_name(value: str | None) -> bool:
+    return not value or value.strip() in {"", "-", "未知名称"}
 
 
 def _latest_market_bar(bundle):

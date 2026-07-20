@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from src.data.providers.baostock_provider import BaostockProvider
 from src.data.symbol_mapper import SymbolMapper
 
 
@@ -27,11 +28,13 @@ class AShareSymbolReference:
         database_path: str = "data/signals.sqlite",
         candidate_file: str = "data/ai_candidates.json",
         name_cache_file: str = "data/symbol_name_cache.json",
+        baostock_provider: BaostockProvider | None = None,
     ) -> None:
         self.reference_path = Path(reference_path)
         self.database_path = Path(database_path)
         self.candidate_file = Path(candidate_file)
         self.name_cache_file = Path(name_cache_file)
+        self.baostock_provider = baostock_provider or BaostockProvider(cache=None, use_cache=False)
 
     def build(
         self,
@@ -186,46 +189,33 @@ class AShareSymbolReference:
 
     def _merge_baostock(self, records: dict[str, dict[str, Any]]) -> None:
         try:
-            import baostock as bs
-        except ImportError:
-            return
-        login = None
-        try:
-            login = bs.login()
-            if login.error_code != "0":
-                return
-            day = datetime.now()
-            result = None
-            for _ in range(15):
-                if day.weekday() < 5:
-                    candidate = bs.query_all_stock(day.strftime("%Y-%m-%d"))
-                    if candidate.error_code == "0":
-                        result = candidate
-                        break
-                day -= timedelta(days=1)
-            if result is None:
-                return
-            while result.next():
-                row = dict(zip(result.fields, result.get_row_data()))
-                code = row.get("code")
-                if not code or not str(code).lower().startswith(("sh.", "sz.", "bj.")):
-                    continue
-                self._upsert(
-                    records,
-                    code,
-                    row.get("code_name") or row.get("codeName"),
-                    "baostock",
-                    None,
-                    "listed" if str(row.get("tradeStatus", "1")) == "1" else "suspended",
-                )
+            with self.baostock_provider.session():
+                day = datetime.now()
+                rows: list[dict[str, Any]] | None = None
+                for _ in range(15):
+                    if day.weekday() < 5:
+                        try:
+                            rows = self.baostock_provider.query_all_stock(day)
+                            break
+                        except Exception:
+                            rows = None
+                    day -= timedelta(days=1)
+                if rows is None:
+                    return
+                for row in rows:
+                    code = row.get("code")
+                    if not code or not str(code).lower().startswith(("sh.", "sz.", "bj.")):
+                        continue
+                    self._upsert(
+                        records,
+                        code,
+                        row.get("code_name") or row.get("codeName"),
+                        "baostock",
+                        None,
+                        "listed" if str(row.get("tradeStatus", "1")) == "1" else "suspended",
+                    )
         except Exception:
             return
-        finally:
-            if login is not None:
-                try:
-                    bs.logout()
-                except Exception:
-                    pass
 
     @classmethod
     def _upsert(

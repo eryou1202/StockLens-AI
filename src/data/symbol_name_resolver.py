@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from src.data.providers.baostock_provider import BaostockProvider
 from src.data.symbol_mapper import SymbolMapper
 from src.models.signal_package import StockLensSignalPackage
 
@@ -15,19 +16,20 @@ class SymbolNameResolver:
 
     INVALID_NAMES = {"", "-", "未知名称", "None", "null"}
 
-    def __init__(self, database_path: str, candidate_file: str = "data/ai_candidates.json"):
+    def __init__(
+        self,
+        database_path: str,
+        candidate_file: str = "data/ai_candidates.json",
+        baostock_provider: BaostockProvider | None = None,
+    ):
         self.database_path = Path(database_path)
         self.candidate_file = Path(candidate_file)
         self.cache_file = self.candidate_file.parent / "symbol_name_cache.json"
+        self.baostock_provider = baostock_provider or BaostockProvider(cache=None, use_cache=False)
 
     def resolve(self, symbol: str) -> str | None:
         normalized = SymbolMapper.normalize(symbol)
-        name = (
-            self._from_candidates(normalized)
-            or self._from_positions(normalized)
-            or self._from_cache(normalized)
-            or self._from_baostock(normalized)
-        )
+        name = self._from_local_sources(normalized) or self._from_baostock(normalized)
         name = self._clean_name(name)
         if name:
             self._save_cache_name(normalized, name)
@@ -35,64 +37,58 @@ class SymbolNameResolver:
 
     def resolve_many(self, symbols: list[str]) -> dict[str, str]:
         result: dict[str, str] = {}
+        missing: list[str] = []
         for symbol in dict.fromkeys(symbols):
             try:
                 normalized = SymbolMapper.normalize(symbol)
-                name = self.resolve(normalized)
             except Exception:
                 continue
+            name = self._clean_name(self._from_local_sources(normalized))
             if name:
                 result[normalized] = name
+                self._save_cache_name(normalized, name)
+            else:
+                missing.append(normalized)
+        if missing:
+            with self.baostock_provider.session():
+                for normalized in missing:
+                    try:
+                        name = self._clean_name(self._from_baostock(normalized))
+                    except Exception:
+                        continue
+                    if name:
+                        result[normalized] = name
+                        self._save_cache_name(normalized, name)
         return result
 
     def update_position_name_if_missing(self, symbol: str) -> str | None:
         normalized = SymbolMapper.normalize(symbol)
         name = self.resolve(normalized)
-        if not name or not self.database_path.exists():
+        if not name:
             return name
-        now = datetime.now().isoformat()
-        with sqlite3.connect(self.database_path) as connection:
-            connection.execute(
-                """
-                UPDATE positions SET stock_name=?, updated_at=?
-                WHERE symbol=? AND (stock_name IS NULL OR TRIM(stock_name)='' OR stock_name='-')
-                """,
-                (name, now, normalized),
-            )
+        self._apply_position_name(normalized, name)
         return name
 
     def update_tracking_name_if_missing(self, symbol: str) -> str | None:
         normalized = SymbolMapper.normalize(symbol)
         name = self.resolve(normalized)
-        if not name or not self.database_path.exists():
+        if not name:
             return name
-        now = datetime.now().isoformat()
-        with sqlite3.connect(self.database_path) as connection:
-            if not self._table_exists(connection, "recommendation_tracking"):
-                return name
-            connection.execute(
-                """
-                UPDATE recommendation_tracking SET stock_name=?, updated_at=?
-                WHERE symbol=? AND (stock_name IS NULL OR TRIM(stock_name)='' OR stock_name='-')
-                """,
-                (name, now, normalized),
-            )
+        self._apply_tracking_name(normalized, name)
         return name
+
+    def update_tracking_names_if_missing(self, symbols: list[str]) -> dict[str, str]:
+        names = self.resolve_many(symbols)
+        for symbol, name in names.items():
+            self._apply_tracking_name(symbol, name)
+        return names
 
     def update_candidate_name_if_missing(self, symbol: str) -> str | None:
         normalized = SymbolMapper.normalize(symbol)
         name = self.resolve(normalized)
-        if not name or not self.candidate_file.exists():
+        if not name:
             return name
-        payload = json.loads(self.candidate_file.read_text(encoding="utf-8"))
-        changed = False
-        for candidate in payload.get("candidates", []):
-            if candidate.get("stock_code") == normalized and not self._clean_name(candidate.get("stock_name")):
-                candidate["stock_name"] = name
-                changed = True
-        if changed:
-            validated = StockLensSignalPackage.model_validate(payload)
-            self._atomic_write(self.candidate_file, validated.model_dump(mode="json"))
+        self._apply_candidate_name(normalized, name)
         return name
 
     def scan_symbols(self) -> list[str]:
@@ -124,17 +120,18 @@ class SymbolNameResolver:
 
     def backfill_all(self) -> dict[str, Any]:
         symbols = self.scan_symbols()
+        names = self.resolve_many(symbols)
         success: list[str] = []
         failed: list[str] = []
         for symbol in symbols:
             try:
-                name = self.resolve(symbol)
+                name = names.get(symbol)
                 if not name:
                     failed.append(symbol)
                     continue
-                self.update_position_name_if_missing(symbol)
-                self.update_tracking_name_if_missing(symbol)
-                self.update_candidate_name_if_missing(symbol)
+                self._apply_position_name(symbol, name)
+                self._apply_tracking_name(symbol, name)
+                self._apply_candidate_name(symbol, name)
                 success.append(symbol)
             except Exception:
                 failed.append(symbol)
@@ -190,25 +187,61 @@ class SymbolNameResolver:
             value = value.get("name")
         return self._clean_name(value)
 
-    @staticmethod
-    def _from_baostock(symbol: str) -> str | None:
+    def _from_local_sources(self, symbol: str) -> str | None:
+        return (
+            self._from_candidates(symbol)
+            or self._from_positions(symbol)
+            or self._from_cache(symbol)
+        )
+
+    def _from_baostock(self, symbol: str) -> str | None:
         try:
-            import baostock as bs
-            login = bs.login()
-            if login.error_code != "0":
-                return None
-            try:
-                result = bs.query_stock_basic(code=SymbolMapper.to_baostock(symbol))
-                if result.error_code != "0" or not result.next():
-                    return None
-                row = dict(zip(result.fields, result.get_row_data()))
-                return SymbolNameResolver._clean_name(
-                    row.get("code_name") or row.get("codeName") or row.get("name")
-                )
-            finally:
-                bs.logout()
+            return self.baostock_provider.get_stock_name(symbol)
         except Exception:
             return None
+
+    def _apply_position_name(self, symbol: str, name: str) -> None:
+        if not self.database_path.exists():
+            return
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.database_path) as connection:
+            if not self._table_exists(connection, "positions"):
+                return
+            connection.execute(
+                """
+                UPDATE positions SET stock_name=?, updated_at=?
+                WHERE symbol=? AND (stock_name IS NULL OR TRIM(stock_name)='' OR stock_name='-')
+                """,
+                (name, now, symbol),
+            )
+
+    def _apply_tracking_name(self, symbol: str, name: str) -> None:
+        if not self.database_path.exists():
+            return
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.database_path) as connection:
+            if not self._table_exists(connection, "recommendation_tracking"):
+                return
+            connection.execute(
+                """
+                UPDATE recommendation_tracking SET stock_name=?, updated_at=?
+                WHERE symbol=? AND (stock_name IS NULL OR TRIM(stock_name)='' OR stock_name='-')
+                """,
+                (name, now, symbol),
+            )
+
+    def _apply_candidate_name(self, symbol: str, name: str) -> None:
+        if not self.candidate_file.exists():
+            return
+        payload = json.loads(self.candidate_file.read_text(encoding="utf-8"))
+        changed = False
+        for candidate in payload.get("candidates", []):
+            if candidate.get("stock_code") == symbol and not self._clean_name(candidate.get("stock_name")):
+                candidate["stock_name"] = name
+                changed = True
+        if changed:
+            validated = StockLensSignalPackage.model_validate(payload)
+            self._atomic_write(self.candidate_file, validated.model_dump(mode="json"))
 
     def _load_cache(self) -> dict[str, Any]:
         if not self.cache_file.exists():

@@ -225,26 +225,27 @@ def _market_date_probe(
     dates: set[datetime.date] = set()
     errors: dict[str, str] = {}
     probed_symbols = symbols[: min(len(symbols), max_symbols)]
-    for symbol in probed_symbols:
-        try:
-            bundle = provider.get_bars(
-                symbol=symbol,
-                start_time=start_time,
-                end_time=end_time,
-                frequency=settings.market_frequency,
-                adjust_type=settings.market_adjust_type,
-            )
-        except Exception as exc:
-            errors[symbol] = f"{type(exc).__name__}: {exc}"
-            continue
-        for bar in bundle.sorted_bars():
-            if bar.trade_time is None:
+    with provider.session():
+        for symbol in probed_symbols:
+            try:
+                bundle = provider.get_bars(
+                    symbol=symbol,
+                    start_time=start_time,
+                    end_time=end_time,
+                    frequency=settings.market_frequency,
+                    adjust_type=settings.market_adjust_type,
+                )
+            except Exception as exc:
+                errors[symbol] = f"{type(exc).__name__}: {exc}"
                 continue
-            if bar.trade_status is not None and str(bar.trade_status).strip() != "1":
-                continue
-            trade_date = bar.trade_time.replace(tzinfo=None).date()
-            if start_time.date() <= trade_date <= end_time.date():
-                dates.add(trade_date)
+            for bar in bundle.sorted_bars():
+                if bar.trade_time is None:
+                    continue
+                if bar.trade_status is not None and str(bar.trade_status).strip() != "1":
+                    continue
+                trade_date = bar.trade_time.replace(tzinfo=None).date()
+                if start_time.date() <= trade_date <= end_time.date():
+                    dates.add(trade_date)
     sorted_dates = sorted(dates)
     return {
         "symbols": probed_symbols,
@@ -322,31 +323,32 @@ def _trading_dates_from_provider(
     window_days = max(refresh_trading_days * 4 + 45, 75)
     candidate_symbols = symbols[: min(len(symbols), 30)]
 
-    for attempt in range(3):
-        start_time = existing_max_date - timedelta(days=window_days * (attempt + 1))
-        for symbol in candidate_symbols:
-            try:
-                bundle = provider.get_bars(
-                    symbol=symbol,
-                    start_time=start_time,
-                    end_time=end_time,
-                    frequency=settings.market_frequency,
-                    adjust_type=settings.market_adjust_type,
-                )
-            except Exception:
-                continue
-            for bar in bundle.sorted_bars():
-                if bar.trade_time is None:
+    with provider.session():
+        for attempt in range(3):
+            start_time = existing_max_date - timedelta(days=window_days * (attempt + 1))
+            for symbol in candidate_symbols:
+                try:
+                    bundle = provider.get_bars(
+                        symbol=symbol,
+                        start_time=start_time,
+                        end_time=end_time,
+                        frequency=settings.market_frequency,
+                        adjust_type=settings.market_adjust_type,
+                    )
+                except Exception:
                     continue
-                trade_time = bar.trade_time.replace(tzinfo=None)
-                trade_date = trade_time.date()
-                if not start_time.date() <= trade_date <= existing_max_date.date():
-                    continue
-                if bar.trade_status is not None and str(bar.trade_status).strip() != "1":
-                    continue
-                collected_dates.add(trade_date)
-        if len(collected_dates) >= refresh_trading_days:
-            break
+                for bar in bundle.sorted_bars():
+                    if bar.trade_time is None:
+                        continue
+                    trade_time = bar.trade_time.replace(tzinfo=None)
+                    trade_date = trade_time.date()
+                    if not start_time.date() <= trade_date <= existing_max_date.date():
+                        continue
+                    if bar.trade_status is not None and str(bar.trade_status).strip() != "1":
+                        continue
+                    collected_dates.add(trade_date)
+            if len(collected_dates) >= refresh_trading_days:
+                break
 
     return [
         datetime.combine(date, existing_max_date.time())

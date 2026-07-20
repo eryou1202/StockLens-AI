@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from datetime import datetime, timedelta
+from typing import Iterator
 
 import numpy as np
 
@@ -16,6 +18,16 @@ class MarketDataProvider(ABC):
     """
 
     provider_name: str = "abstract"
+
+    @contextmanager
+    def session(self) -> Iterator[MarketDataProvider]:
+        yield self
+
+    def session_stats(self) -> dict[str, int]:
+        return {}
+
+    def reset_session_stats(self) -> None:
+        return None
 
     @abstractmethod
     def get_bars(

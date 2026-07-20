@@ -1378,8 +1378,7 @@ with tab_tracking:
         item.symbol for item in items
         if not item.stock_name or item.stock_name.strip() in {"", "-", "未知名称"}
     ]
-    for missing_symbol in dict.fromkeys(missing_tracking_names):
-        NAME_RESOLVER.update_tracking_name_if_missing(missing_symbol)
+    NAME_RESOLVER.update_tracking_names_if_missing(list(dict.fromkeys(missing_tracking_names)))
     if missing_tracking_names:
         items = tracker.list_tracking(status_filter)
     if action_filter:

@@ -50,27 +50,28 @@ class ResearchPipeline:
 
         start_time = as_of_time - timedelta(days=self.lookback_days)
 
-        for candidate in candidates:
-            market_data = self.market_data_provider.get_bars(
-                symbol=candidate.stock_code,
-                start_time=start_time,
-                end_time=as_of_time,
-                frequency=self.frequency,
-                adjust_type=self.adjust_type,
-            )
+        with self.market_data_provider.session():
+            for candidate in candidates:
+                market_data = self.market_data_provider.get_bars(
+                    symbol=candidate.stock_code,
+                    start_time=start_time,
+                    end_time=as_of_time,
+                    frequency=self.frequency,
+                    adjust_type=self.adjust_type,
+                )
 
-            quant_result = self.quant_engine.analyze(
-                candidate=candidate,
-                market_data=market_data,
-                as_of_time=as_of_time,
-            )
+                quant_result = self.quant_engine.analyze(
+                    candidate=candidate,
+                    market_data=market_data,
+                    as_of_time=as_of_time,
+                )
 
-            final_decision = self.decision_engine.merge(
-                ai_signal=candidate,
-                quant_signal=quant_result,
-            )
+                final_decision = self.decision_engine.merge(
+                    ai_signal=candidate,
+                    quant_signal=quant_result,
+                )
 
-            self.store.save_decision(final_decision)
-            final_decisions.append(final_decision)
+                self.store.save_decision(final_decision)
+                final_decisions.append(final_decision)
 
         return self.report_builder.build_watchlist(final_decisions)

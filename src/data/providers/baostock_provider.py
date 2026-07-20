@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterator
 
 import pandas as pd
 
@@ -62,6 +63,71 @@ class BaostockProvider(MarketDataProvider):
     def __init__(self, cache: MarketDataCache | None = None, use_cache: bool = True):
         self.cache = cache
         self.use_cache = use_cache
+        self._session_depth = 0
+        self._logged_in = False
+        self._bs: Any | None = None
+        self._last_logout_error: str | None = None
+        self._stats = {
+            "login_count": 0,
+            "logout_count": 0,
+            "history_query_count": 0,
+            "trade_calendar_query_count": 0,
+            "stock_basic_query_count": 0,
+            "all_stock_query_count": 0,
+            "cache_hit_count": 0,
+        }
+
+    @contextmanager
+    def session(self) -> Iterator[BaostockProvider]:
+        # Baostock uses process-global login state. This session is for
+        # sequential work in the current Python process/thread only.
+        self._session_depth += 1
+        try:
+            yield self
+        finally:
+            self._session_depth = max(0, self._session_depth - 1)
+            if self._session_depth == 0:
+                self.close()
+
+    def close(self) -> None:
+        if not self._logged_in or self._bs is None:
+            self._logged_in = False
+            self._bs = None
+            return
+        try:
+            self._bs.logout()
+            self._stats["logout_count"] += 1
+            self._last_logout_error = None
+        except Exception as exc:
+            self._last_logout_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._logged_in = False
+            self._bs = None
+
+    def session_stats(self) -> dict[str, int]:
+        return dict(self._stats)
+
+    def reset_session_stats(self) -> None:
+        for key in self._stats:
+            self._stats[key] = 0
+        self._last_logout_error = None
+
+    def _ensure_login(self) -> Any:
+        if self._logged_in and self._bs is not None:
+            return self._bs
+        try:
+            import baostock as bs
+        except ImportError as exc:
+            raise ImportError("baostock is not installed; run: pip install baostock") from exc
+        lg = bs.login()
+        if lg.error_code != "0":
+            self._logged_in = False
+            self._bs = None
+            raise RuntimeError(f"Baostock login failed: {lg.error_msg}")
+        self._bs = bs
+        self._logged_in = True
+        self._stats["login_count"] += 1
+        return bs
 
     def get_bars(
         self,
@@ -83,14 +149,9 @@ class BaostockProvider(MarketDataProvider):
                 adjust_type=adjust_type,
             )
             if cached:
+                self._stats["cache_hit_count"] += 1
                 return cached
 
-        try:
-            import baostock as bs
-        except ImportError as exc:
-            raise ImportError("未安装 baostock，请运行：pip install baostock") from exc
-
-        bs_symbol = SymbolMapper.to_baostock(internal_symbol)
         bs_frequency = self.FREQ_MAP.get(frequency)
         if not bs_frequency:
             raise ValueError(f"Baostock 暂不支持 frequency={frequency}")
@@ -99,57 +160,81 @@ class BaostockProvider(MarketDataProvider):
         if not bs_adjust:
             raise ValueError(f"Baostock 暂不支持 adjust_type={adjust_type}")
 
-        lg = bs.login()
-        if lg.error_code != "0":
-            raise RuntimeError(f"Baostock login failed: {lg.error_msg}")
-
-        try:
-            rs = bs.query_history_k_data_plus(
-                bs_symbol,
-                self.DEFAULT_FIELDS,
-                start_date=start_time.strftime("%Y-%m-%d"),
-                end_date=end_time.strftime("%Y-%m-%d"),
-                frequency=bs_frequency,
-                adjustflag=bs_adjust,
-            )
-
-            if rs.error_code != "0":
-                raise RuntimeError(f"Baostock query failed: {rs.error_msg}")
-
-            rows: list[dict[str, Any]] = []
-            while rs.next():
-                rows.append(rs.get_row_data())
-
-            df = pd.DataFrame(rows, columns=rs.fields)
-            bars = self._frame_to_bars(
-                df=df,
-                internal_symbol=internal_symbol,
-                frequency=frequency,
-                adjust_type=adjust_type,
-                raw_symbol=bs_symbol,
-            )
-
-            bundle = MarketDataBundle(
+        with self.session():
+            bundle = self.query_history_bars(
                 symbol=internal_symbol,
                 start_time=start_time,
                 end_time=end_time,
                 frequency=frequency,
                 adjust_type=adjust_type,
-                provider=self.provider_name,
-                bars=bars,
-                data_quality={
-                    "from_cache": False,
-                    "rows": len(bars),
-                    "source_symbol": bs_symbol,
-                },
             )
 
-            if self.use_cache and self.cache:
-                self.cache.save_bundle(bundle)
+        if self.use_cache and self.cache:
+            self.cache.save_bundle(bundle)
 
-            return bundle
-        finally:
-            bs.logout()
+        return bundle
+
+    def query_history_bars(
+        self,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+        frequency: str = "1d",
+        adjust_type: str = "qfq",
+    ) -> MarketDataBundle:
+        if self._session_depth == 0:
+            with self.session():
+                return self.query_history_bars(symbol, start_time, end_time, frequency, adjust_type)
+        internal_symbol = SymbolMapper.normalize(symbol)
+        bs_symbol = SymbolMapper.to_baostock(internal_symbol)
+        bs_frequency = self.FREQ_MAP.get(frequency)
+        if not bs_frequency:
+            raise ValueError(f"Baostock 暂不支持 frequency={frequency}")
+        bs_adjust = self.ADJUST_MAP.get(adjust_type)
+        if not bs_adjust:
+            raise ValueError(f"Baostock 暂不支持 adjust_type={adjust_type}")
+
+        bs = self._ensure_login()
+        self._stats["history_query_count"] += 1
+        rs = bs.query_history_k_data_plus(
+            bs_symbol,
+            self.DEFAULT_FIELDS,
+            start_date=start_time.strftime("%Y-%m-%d"),
+            end_date=end_time.strftime("%Y-%m-%d"),
+            frequency=bs_frequency,
+            adjustflag=bs_adjust,
+        )
+
+        if rs.error_code != "0":
+            raise RuntimeError(f"Baostock query failed: {rs.error_msg}")
+
+        rows: list[dict[str, Any]] = []
+        while rs.next():
+            rows.append(rs.get_row_data())
+
+        df = pd.DataFrame(rows, columns=rs.fields)
+        bars = self._frame_to_bars(
+            df=df,
+            internal_symbol=internal_symbol,
+            frequency=frequency,
+            adjust_type=adjust_type,
+            raw_symbol=bs_symbol,
+        )
+
+        return MarketDataBundle(
+            symbol=internal_symbol,
+            start_time=start_time,
+            end_time=end_time,
+            frequency=frequency,
+            adjust_type=adjust_type,
+            provider=self.provider_name,
+            bars=bars,
+            data_quality={
+                "from_cache": False,
+                "rows": len(bars),
+                "source_symbol": bs_symbol,
+            },
+        )
 
     def get_trade_calendar(self, start_time: datetime, end_time: datetime) -> list[datetime]:
         """
@@ -159,31 +244,28 @@ class BaostockProvider(MarketDataProvider):
         - 解析 is_trading_day
         - 只返回交易日
         """
-        try:
-            import baostock as bs
-        except ImportError as exc:
-            raise ImportError("未安装 baostock，请运行：pip install baostock") from exc
+        with self.session():
+            return self.query_trade_calendar(start_time, end_time)
 
-        lg = bs.login()
-        if lg.error_code != "0":
-            raise RuntimeError(f"Baostock login failed: {lg.error_msg}")
+    def query_trade_calendar(self, start_time: datetime, end_time: datetime) -> list[datetime]:
+        if self._session_depth == 0:
+            with self.session():
+                return self.query_trade_calendar(start_time, end_time)
+        bs = self._ensure_login()
+        self._stats["trade_calendar_query_count"] += 1
+        rs = bs.query_trade_dates(
+            start_date=start_time.strftime("%Y-%m-%d"),
+            end_date=end_time.strftime("%Y-%m-%d"),
+        )
+        if rs.error_code != "0":
+            raise RuntimeError(f"Baostock query_trade_dates failed: {rs.error_msg}")
 
-        try:
-            rs = bs.query_trade_dates(
-                start_date=start_time.strftime("%Y-%m-%d"),
-                end_date=end_time.strftime("%Y-%m-%d"),
-            )
-            if rs.error_code != "0":
-                raise RuntimeError(f"Baostock query_trade_dates failed: {rs.error_msg}")
-
-            days = []
-            while rs.next():
-                row = dict(zip(rs.fields, rs.get_row_data()))
-                if row.get("is_trading_day") == "1":
-                    days.append(datetime.strptime(row["calendar_date"], "%Y-%m-%d"))
-            return days
-        finally:
-            bs.logout()
+        days = []
+        while rs.next():
+            row = dict(zip(rs.fields, rs.get_row_data()))
+            if row.get("is_trading_day") == "1":
+                days.append(datetime.strptime(row["calendar_date"], "%Y-%m-%d"))
+        return days
 
     def get_stock_status(self, symbol: str, as_of_time: datetime) -> StockStatus:
         """
@@ -194,35 +276,63 @@ class BaostockProvider(MarketDataProvider):
         - 与 K 线中的 tradestatus / isST 合并
         """
         internal_symbol = SymbolMapper.normalize(symbol)
+
+        with self.session():
+            raw = self.query_stock_basic(internal_symbol)
+
+        return StockStatus(
+            symbol=internal_symbol,
+            as_of_time=as_of_time,
+            is_trading=None,
+            is_st=None,
+            listed_date=self._parse_date_or_none(raw.get("ipoDate")),
+            delisted_date=self._parse_date_or_none(raw.get("outDate")),
+            provider=self.provider_name,
+            raw=raw,
+        )
+
+    def query_stock_basic(self, symbol: str) -> dict[str, Any]:
+        if self._session_depth == 0:
+            with self.session():
+                return self.query_stock_basic(symbol)
+        internal_symbol = SymbolMapper.normalize(symbol)
         bs_symbol = SymbolMapper.to_baostock(internal_symbol)
+        bs = self._ensure_login()
+        self._stats["stock_basic_query_count"] += 1
+        rs = bs.query_stock_basic(code=bs_symbol)
+        raw: dict[str, Any] = {}
+        if rs.error_code == "0" and rs.next():
+            raw = dict(zip(rs.fields, rs.get_row_data()))
+        return raw
 
-        try:
-            import baostock as bs
-        except ImportError as exc:
-            raise ImportError("未安装 baostock，请运行：pip install baostock") from exc
+    def get_stock_name(self, symbol: str) -> str | None:
+        with self.session():
+            raw = self.query_stock_basic(symbol)
+        return self.stock_name_from_basic(raw)
 
-        lg = bs.login()
-        if lg.error_code != "0":
-            raise RuntimeError(f"Baostock login failed: {lg.error_msg}")
+    def query_all_stock(self, query_date: datetime) -> list[dict[str, Any]]:
+        if self._session_depth == 0:
+            with self.session():
+                return self.query_all_stock(query_date)
+        bs = self._ensure_login()
+        self._stats["all_stock_query_count"] += 1
+        result = bs.query_all_stock(query_date.strftime("%Y-%m-%d"))
+        if result.error_code != "0":
+            raise RuntimeError(f"Baostock query_all_stock failed: {result.error_msg}")
+        rows: list[dict[str, Any]] = []
+        while result.next():
+            rows.append(dict(zip(result.fields, result.get_row_data())))
+        return rows
 
-        try:
-            rs = bs.query_stock_basic(code=bs_symbol)
-            raw = {}
-            if rs.error_code == "0" and rs.next():
-                raw = dict(zip(rs.fields, rs.get_row_data()))
-
-            return StockStatus(
-                symbol=internal_symbol,
-                as_of_time=as_of_time,
-                is_trading=None,
-                is_st=None,
-                listed_date=self._parse_date_or_none(raw.get("ipoDate")),
-                delisted_date=self._parse_date_or_none(raw.get("outDate")),
-                provider=self.provider_name,
-                raw=raw,
-            )
-        finally:
-            bs.logout()
+    @staticmethod
+    def stock_name_from_basic(raw: dict[str, Any]) -> str | None:
+        for key in ("code_name", "codeName", "name"):
+            value = raw.get(key)
+            if value:
+                text = str(value).strip()
+                if text:
+                    return text
+        return None
 
     def _frame_to_bars(
         self,

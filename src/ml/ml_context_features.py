@@ -44,20 +44,21 @@ class MLContextFeatureBuilder:
         self.symbol_bundles = dict(symbol_bundles)
         self._context_cache.clear()
         self._warnings.clear()
-        for alias, symbol in self.INDEXES.items():
-            try:
-                self.index_bundles[alias] = self.provider.get_bars(
-                    symbol=symbol,
-                    start_time=start_date - timedelta(days=self.lookback_days + 10),
-                    end_time=end_date,
-                    frequency=self.frequency,
-                    adjust_type=self.adjust_type,
-                )
-            except Exception as exc:
-                self.index_bundles[alias] = None
-                self._warnings.setdefault("global", []).append(
-                    f"index_{alias}_unavailable:{type(exc).__name__}"
-                )
+        with self.provider.session():
+            for alias, symbol in self.INDEXES.items():
+                try:
+                    self.index_bundles[alias] = self.provider.get_bars(
+                        symbol=symbol,
+                        start_time=start_date - timedelta(days=self.lookback_days + 10),
+                        end_time=end_date,
+                        frequency=self.frequency,
+                        adjust_type=self.adjust_type,
+                    )
+                except Exception as exc:
+                    self.index_bundles[alias] = None
+                    self._warnings.setdefault("global", []).append(
+                        f"index_{alias}_unavailable:{type(exc).__name__}"
+                    )
 
     def build(
         self,

@@ -65,21 +65,22 @@ class MLDatasetBuilder:
         max_horizon = max(request.horizons) if request.horizons else 1
         prepared: list[tuple[str, MarketDataBundle | None, list[datetime], Exception | None]] = []
 
-        for symbol in symbols:
-            try:
-                full_bundle = self.provider.get_bars(
-                    symbol=symbol,
-                    start_time=request.start_date - timedelta(days=request.lookback_days + 10),
-                    end_time=request.end_date + timedelta(days=max_horizon * 3 + 15),
-                    frequency=self.settings.market_frequency,
-                    adjust_type=self.settings.market_adjust_type,
-                )
-                dates = self._sample_dates(request, full_bundle)
-                if not dates:
-                    raise ValueError("no trading bars in requested date range")
-                prepared.append((symbol, full_bundle, dates, None))
-            except Exception as exc:
-                prepared.append((symbol, None, [self._failure_as_of(request)], exc))
+        with self.provider.session():
+            for symbol in symbols:
+                try:
+                    full_bundle = self.provider.get_bars(
+                        symbol=symbol,
+                        start_time=request.start_date - timedelta(days=request.lookback_days + 10),
+                        end_time=request.end_date + timedelta(days=max_horizon * 3 + 15),
+                        frequency=self.settings.market_frequency,
+                        adjust_type=self.settings.market_adjust_type,
+                    )
+                    dates = self._sample_dates(request, full_bundle)
+                    if not dates:
+                        raise ValueError("no trading bars in requested date range")
+                    prepared.append((symbol, full_bundle, dates, None))
+                except Exception as exc:
+                    prepared.append((symbol, None, [self._failure_as_of(request)], exc))
 
         total = sum(len(dates) for _symbol, _bundle, dates, _error in prepared)
         context_builder: MLContextFeatureBuilder | None = None

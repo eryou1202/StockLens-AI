@@ -44,29 +44,30 @@ class AlgorithmAuditRunner:
         total = len(symbols) * len(dates)
         samples: list[AuditSample] = []
 
-        for symbol in symbols:
-            try:
-                full_bundle = self.market_data_provider.get_bars(
-                    symbol=symbol,
-                    start_time=request.start_date - timedelta(days=request.lookback_days),
-                    end_time=request.end_date + timedelta(days=45),
-                    frequency=self.settings.market_frequency,
-                    adjust_type=self.settings.market_adjust_type,
-                )
-            except Exception as exc:
-                for as_of_time in dates:
-                    samples.append(self._error_sample(audit_id, symbol, as_of_time, exc))
-                    self._progress(symbol, as_of_time, len(samples), total)
-                continue
-
-            for as_of_time in dates:
+        with self.market_data_provider.session():
+            for symbol in symbols:
                 try:
-                    samples.append(
-                        self._build_sample(audit_id, symbol, as_of_time, request, full_bundle)
+                    full_bundle = self.market_data_provider.get_bars(
+                        symbol=symbol,
+                        start_time=request.start_date - timedelta(days=request.lookback_days),
+                        end_time=request.end_date + timedelta(days=45),
+                        frequency=self.settings.market_frequency,
+                        adjust_type=self.settings.market_adjust_type,
                     )
                 except Exception as exc:
-                    samples.append(self._error_sample(audit_id, symbol, as_of_time, exc))
-                self._progress(symbol, as_of_time, len(samples), total)
+                    for as_of_time in dates:
+                        samples.append(self._error_sample(audit_id, symbol, as_of_time, exc))
+                        self._progress(symbol, as_of_time, len(samples), total)
+                    continue
+
+                for as_of_time in dates:
+                    try:
+                        samples.append(
+                            self._build_sample(audit_id, symbol, as_of_time, request, full_bundle)
+                        )
+                    except Exception as exc:
+                        samples.append(self._error_sample(audit_id, symbol, as_of_time, exc))
+                    self._progress(symbol, as_of_time, len(samples), total)
         return samples
 
     def _build_sample(

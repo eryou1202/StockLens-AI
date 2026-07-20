@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,11 +23,17 @@ class SQLiteSignalStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self):
-        return sqlite3.connect(self.db_path)
+    @contextmanager
+    def _connection(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _init_db(self):
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS signal_snapshots (
@@ -232,7 +239,7 @@ class SQLiteSignalStore:
             decision.final_score,
             decision.model_dump_json(),
         )
-        with self._connect() as conn:
+        with self._connection() as conn:
             existing = conn.execute(
                 "SELECT id FROM signal_snapshots "
                 "WHERE symbol = ? AND as_of_time = ? ORDER BY id DESC LIMIT 1",
@@ -259,7 +266,7 @@ class SQLiteSignalStore:
                 )
 
     def list_recent_decisions(self, limit: int = 20) -> list[dict]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 """
                 SELECT symbol, as_of_time, final_level, final_score, final_decision_json
@@ -296,7 +303,7 @@ class SQLiteSignalStore:
             query += " LIMIT ?"
             params = (max(0, int(limit)),)
 
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(query, params).fetchall()
 
         signals: list[dict[str, Any]] = []
@@ -376,7 +383,7 @@ class SQLiteSignalStore:
             json.dumps(combined_metadata, ensure_ascii=False, default=str),
         ]
 
-        with self._connect() as conn:
+        with self._connection() as conn:
             existing = conn.execute(
                 "SELECT id, created_at FROM signal_feedback WHERE symbol = ? AND as_of_time = ? LIMIT 1",
                 (label.symbol, stored_as_of_time),
@@ -397,7 +404,7 @@ class SQLiteSignalStore:
                 )
 
     def feedback_status_counts(self) -> dict[str, int]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT feedback_status, COUNT(*) FROM signal_feedback GROUP BY feedback_status"
             ).fetchall()
